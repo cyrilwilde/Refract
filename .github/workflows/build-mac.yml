@@ -1,0 +1,55 @@
+# Builds Refract on one of GitHub's Mac machines and produces Refract.pkg.
+name: Build Mac installer
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Generate Xcode project (downloads JUCE)
+        run: cmake -B build -G Xcode
+
+      - name: Compile (universal binary, Release)
+        run: cmake --build build --config Release -- -quiet
+
+      - name: Collect the plugins
+        run: |
+          ART=build/Refract_artefacts/Release
+          mkdir -p pkgroot/vst3 pkgroot/au
+          cp -R "$ART/VST3/Refract.vst3"     pkgroot/vst3/
+          cp -R "$ART/AU/Refract.component"  pkgroot/au/
+          codesign --force --deep -s - pkgroot/vst3/Refract.vst3
+          codesign --force --deep -s - pkgroot/au/Refract.component
+          echo "Architectures:"
+          lipo -archs pkgroot/vst3/Refract.vst3/Contents/MacOS/Refract
+
+      - name: Check the AU with Apple's validator
+        continue-on-error: true
+        run: auval -v aumu Rfr1 Rfau
+
+      - name: Build Refract.pkg
+        run: |
+          for f in vst3 au; do
+            pkgbuild --analyze --root pkgroot/$f $f.plist
+            plutil -replace 0.BundleIsRelocatable -bool NO $f.plist
+          done
+          pkgbuild --root pkgroot/vst3 --component-plist vst3.plist \
+                   --identifier com.refractaudio.refract.vst3 --version 1.0.0 \
+                   --install-location "/Library/Audio/Plug-Ins/VST3" Refract-VST3.pkg
+          pkgbuild --root pkgroot/au --component-plist au.plist \
+                   --identifier com.refractaudio.refract.au --version 1.0.0 \
+                   --install-location "/Library/Audio/Plug-Ins/Components" Refract-AU.pkg
+          mkdir -p dist
+          productbuild --package Refract-VST3.pkg --package Refract-AU.pkg dist/Refract.pkg
+
+      - name: Upload Refract.pkg
+        uses: actions/upload-artifact@v4
+        with:
+          name: Refract-installer
+          path: dist/Refract.pkg
