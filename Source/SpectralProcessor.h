@@ -21,9 +21,9 @@ namespace refract::spectral
     constexpr int fftSize  = 1 << fftOrder;
     constexpr int hopSize  = fftSize / 4;     // 75% overlap between frames
 
-    using Mask = std::vector<uint8_t>;        // maskWidth * maskHeight, 255 = keep, 0 = remove
+    using Mask = std::vector<uint8_t>;        // maskWidth * maskHeight: 0 = removed, maskUnity = untouched, 255 = +12 dB
 
-    inline Mask makeEmptyMask() { return Mask ((size_t) (maskWidth * maskHeight), 255); }
+    inline Mask makeEmptyMask() { return Mask ((size_t) (maskWidth * maskHeight), (uint8_t) maskUnity); }
     bool isMaskEmpty (const Mask& mask);      // true if nothing has been painted
 
     // Returns the edited audio, or an empty buffer if shouldAbort() returned true.

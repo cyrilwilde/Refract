@@ -262,6 +262,47 @@ All of these dials can be modulated, like everything else.
 
 **Starting setup:** Bus A starts with a synced delay and Bus B with a reverb. Turn up a sound's Send A or Send B to hear them.
 
+### Granular mode and brushes (Stage 6)
+
+**Granular mode.** Switch a layer from **Classic** to **Granular** with the menu in the layer's toolbar. The layer then plays as a cloud of tiny overlapping snippets ("grains") taken from the sample. This is great for pads, textures, frozen moments and glitchy movement.
+
+The controls along the bottom of the layer change to:
+
+- **Position:** where in the sample the grains come from. You can also drag the **G** flag in the ruler. Start and End still mark the part of the sample that can be used.
+- **Size:** the length of each grain, from 5 ms (buzzy, granular) to 1 s (smooth, smeared).
+- **Density:** how many grains start each second.
+- **Spray:** scatters where each grain starts around Position. The pale band on the waveform shows the range.
+- **Rnd Pitch:** random pitch per grain (± semitones), for shimmering, chorus-like clouds.
+- **Shape:** 0 gives soft, smooth grains; towards 1 gives flatter, punchier grains.
+- **Spread:** scatters grains across the stereo field.
+- **Reverse:** the chance of each grain playing backwards.
+- **Scan:** moves Position through the sample by itself. 1x is normal speed, small values give slow time-stretching, and negative values go backwards.
+- **Freeze:** holds Position still.
+
+Tuning (Root / Transpose / Fine), the keyboard, glide and every modulation work the same as in Classic. While notes play, each grain shows as a short tick on the waveform.
+
+**Brushes** (Spectral view):
+
+| Tool | What it does |
+|---|---|
+| **Soft / Hard / Square Brush** | Freehand painting with different edges. |
+| **Spray** | Random speckles, for texture instead of clean cuts. |
+| **Smudge** | Blurs earlier edits, softening their edges. |
+| **Harmonic** | Paints the note under the cursor *and* all its overtones at once; the faint lines show where. Great for removing (or isolating, with Invert) a pitched sound. |
+| **Freq Band** | A horizontal band across the whole sample, e.g. "remove everything around 3 kHz". |
+| **Time Slice** | A vertical slice through every frequency, e.g. "silence this moment". |
+| **Rectangle / Ellipse / Heart** | Drag out a box; the shape is applied when you let go. |
+
+**Modes:**
+- **Remove** cuts frequencies.
+- **Restore** brings them back to normal.
+- **Boost** raises them, by up to +12 dB at full Strength. Boosted areas look lighter.
+- Right-dragging switches between Remove and Restore.
+
+**Undo / Redo** step back and forward through your last 30 painting actions. Reset and Invert count as actions too.
+
+Painting from older saves is converted automatically to the new scale (which now makes room for Boost).
+
 ---
 
 ## Part 3: How it works
@@ -485,6 +526,21 @@ JUCE's `Synthesiser` class handles MIDI: it finds a free voice for each note-on 
   - *Tape* moves the read point with two sine waves (wow at 0.6 Hz, flutter at 7 Hz) and puts `tanh` saturation in the feedback.
   - *Granular* starts an 80 ms grain every 20 ms from around the delay point. Each grain reads at `2^(semitones/12)` speed with a smooth Hann fade in and out, and the grains are fed back into the delay buffer.
 - **Big host blocks.** Live can occasionally send a bigger audio block than it said it would in `prepareToPlay`. `processBlock` cuts such blocks into pieces it was prepared for, so nothing ever has to allocate memory while playing.
+
+### 3.15 Stage 6: how granular mode and the brushes work
+
+- **Grains** (`spawnGrain` / `renderGrains` in `SynthVoice.cpp`).
+  - Every `sampleRate / Density` samples (with ±15 % randomness, so it sounds natural rather than machine-gun regular), the voice starts a new grain.
+  - Each grain picks a start point (Position ± Spray), a speed (the note's normal playback speed × a random pitch offset, negative if it plays backwards), a pan and a length (Size).
+  - While a grain plays, it's multiplied by a *window*, a fade in and out, so it never clicks. Shape morphs the window from a Hann bell into a flat-topped "Tukey" window with short fades.
+  - Up to 24 grains per layer per note overlap. The total is divided by √(Density × Size) so the loudness stays roughly the same when you change them.
+- **Scan** advances an offset every block, in proportion to the note's playback speed. At 1x the cloud moves through the sample exactly as fast as normal playback would. That's what makes it a time-stretch: the pitch comes from the note, and the speed comes from Scan.
+- **The grain ticks** in the sample view come from a small ring buffer of atomics (`GrainMarks`). Each new grain writes its start point into it, and the UI draws the last 64.
+- **The mask scale changed** from "255 = untouched" to "200 = untouched, 255 = +12 dB" (`maskToGain`). That leaves room for Boost while still fitting in one byte per cell. Old saves carry no `maskVersion`, so their values are rescaled when loaded.
+- **The Harmonic brush** converts the cursor height to a frequency `f`, then stamps at `2f`, `3f`, `4f`... up to 20 kHz. Because the frequency axis is logarithmic, the stamps get closer together towards the top, just like the harmonics of a real note.
+- **Smudge** replaces each cell with a blend of itself and the average of the 5×5 cells around it, read from a snapshot of the mask so the blur doesn't drag in the direction you paint.
+- **The heart** is the classic curve `(x² + y² − 1)³ − x²y³ ≤ 0`. Any cell whose position makes that true gets painted. The outline you see while dragging uses the heart's parametric form (`16 sin³t`, `13 cos t − 5 cos 2t − ...`).
+- **Undo** simply keeps copies of the mask (about 260 KB each, up to 30 of them) from before each action.
 
 ---
 

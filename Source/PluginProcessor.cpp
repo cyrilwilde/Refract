@@ -73,6 +73,7 @@ RefractAudioProcessor::RefractAudioProcessor()
     shared.bank = &bank;
     shared.wavetables = &wavetables;
     shared.playheads = &playheads;
+    shared.grainMarks = &grainMarks;
     shared.leadOffsets.assign ((size_t) table.size(), 0.0f);
     synth.shared = &shared;
 
@@ -644,6 +645,7 @@ juce::ValueTree RefractAudioProcessor::createStateTree()
         l.setProperty ("index", i, nullptr);
         l.setProperty ("file", slot.file.getFullPathName(), nullptr);
         l.setProperty ("mask", encodeMask (slot.mask), nullptr);
+        l.setProperty ("maskVersion", 2, nullptr);   // 2 = unity at 200, so painting can boost
         layerTree.appendChild (l, nullptr);
     }
     root.appendChild (layerTree, nullptr);
@@ -710,7 +712,11 @@ void RefractAudioProcessor::restoreStateTree (const juce::ValueTree& root)
 
         auto& slot = layers[(size_t) i];
         slot.file = juce::File (path);
-        slot.mask = decodeMask (l.getProperty ("mask").toString());
+        const auto maskText = l.getProperty ("mask").toString();
+        slot.mask = decodeMask (maskText);
+        if (maskText.isNotEmpty() && (int) l.getProperty ("maskVersion", 1) < 2)
+            for (auto& v : slot.mask)   // older saves used 255 = untouched
+                v = (uint8_t) juce::roundToInt ((float) v * (float) maskUnity / 255.0f);
         startJob (i, true);
     }
     for (int i = 0; i < numLayers; ++i)

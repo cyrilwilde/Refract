@@ -110,6 +110,7 @@ namespace refract
         const PlaybackBank*  bank = nullptr;
         const WavetableBank* wavetables = nullptr;
         PlayheadArray*       playheads = nullptr;
+        GrainMarks*          grainMarks = nullptr;
 
         HostInfo host;
         float modWheel = 0.0f, aftertouch = 0.0f;
@@ -180,6 +181,22 @@ namespace refract
 
             int numCopies = 1;
             std::array<SampleReader, maxLayerUnison> copies;
+
+            // Granular mode
+            struct Grain
+            {
+                bool   active = false;
+                double pos = 0.0, rate = 1.0;
+                int    age = 0, length = 1;
+                float  panL = 1.0f, panR = 1.0f;
+            };
+            bool granular = false;
+            std::array<Grain, maxGrains> grains;
+            double spawnCountdown = 0.0, scanOffset = 0.0;
+            double grainRegionStart = 0.0, grainRegionEnd = 1.0, grainCentre = 0.0;   // in samples
+            double grainLength = 4000.0, grainInterval = 1600.0;
+            float  grainSpray = 0.0f, grainPitchRandom = 0.0f, grainShape = 0.0f, grainSpread = 0.5f,
+                   grainReverse = 0.0f, grainGain = 1.0f, grainPan = 0.0f;
             float gain = 0.0f, gainStep = 0.0f;   // level, ramped smoothly
 
             bool anyActive() const
@@ -216,6 +233,9 @@ namespace refract
         void updateRegion (LayerState& ls, const ParamRefs::Layer& lp, bool setStart);
         void updateOscillator (int index, double baseHz, int numSamples);
         void restartLayers();
+        void updateGranular (LayerState& ls, const ParamRefs::Layer& lp, float layerPan, int numSamples);
+        void spawnGrain (LayerState& ls, int layerIndex);
+        void renderGrains (LayerState& ls, int layerIndex, float& left, float& right);
         void finishNote();
         void publishPlayheads();
         float renderOsc (OscState& o, float& left, float& right, const OscState* master, float fm, bool sync);

@@ -120,6 +120,19 @@ namespace refract
             l.add (std::make_unique<juce::AudioParameterInt> (pid (ids::layer (i, "unison")), n + "Unison", 1, maxLayerUnison, 1));
             addFloat  (l, ids::layer (i, "detune"),    n + "Unison Detune", { 0.0f, 1.0f }, 0.2f);
             addFloat  (l, ids::layer (i, "spread"),    n + "Unison Spread", { 0.0f, 1.0f }, 0.5f);
+
+            // Granular: play the sample as a cloud of tiny overlapping "grains"
+            addChoice (l, ids::layer (i, "mode"),     n + "Mode", layerModeNames(), layerClassic);
+            addFloat  (l, ids::layer (i, "gpos"),     n + "Grain Position", { 0.0f, 1.0f }, 0.25f, "%");
+            addFloat  (l, ids::layer (i, "gsize"),    n + "Grain Size", skewed (0.005f, 1.0f, 0.1f), 0.08f, "s");
+            addFloat  (l, ids::layer (i, "gdens"),    n + "Grain Density", skewed (1.0f, 200.0f, 25.0f), 30.0f, "Hz");
+            addFloat  (l, ids::layer (i, "gspray"),   n + "Grain Spray", { 0.0f, 1.0f }, 0.1f, "%");
+            addFloat  (l, ids::layer (i, "gprnd"),    n + "Grain Random Pitch", { 0.0f, 12.0f, 0.01f }, 0.0f, "st");
+            addFloat  (l, ids::layer (i, "gshape"),   n + "Grain Shape", { 0.0f, 1.0f }, 0.0f);
+            addFloat  (l, ids::layer (i, "gspread"),  n + "Grain Spread", { 0.0f, 1.0f }, 0.5f, "%");
+            addFloat  (l, ids::layer (i, "grev"),     n + "Grain Reverse", { 0.0f, 1.0f }, 0.0f, "%");
+            addFloat  (l, ids::layer (i, "gscan"),    n + "Grain Scan", { -2.0f, 2.0f, 0.001f }, 0.0f, "x");
+            addBool   (l, ids::layer (i, "gfreeze"),  n + "Grain Freeze", false);
         }
 
         // --- Oscillators ---------------------------------------------------
@@ -363,6 +376,17 @@ namespace refract
             L.unison    = idx (ids::layer (i, "unison"));
             L.detune    = idx (ids::layer (i, "detune"));
             L.spread    = idx (ids::layer (i, "spread"));
+            L.mode             = raw (ids::layer (i, "mode"));
+            L.freeze           = raw (ids::layer (i, "gfreeze"));
+            L.grainPos         = idx (ids::layer (i, "gpos"));
+            L.grainSize        = idx (ids::layer (i, "gsize"));
+            L.grainDensity     = idx (ids::layer (i, "gdens"));
+            L.grainSpray       = idx (ids::layer (i, "gspray"));
+            L.grainPitchRandom = idx (ids::layer (i, "gprnd"));
+            L.grainShape       = idx (ids::layer (i, "gshape"));
+            L.grainSpread      = idx (ids::layer (i, "gspread"));
+            L.grainReverse     = idx (ids::layer (i, "grev"));
+            L.grainScan        = idx (ids::layer (i, "gscan"));
         }
 
         for (int o = 0; o < numOscs; ++o)

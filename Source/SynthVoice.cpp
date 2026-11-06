@@ -130,6 +130,12 @@ namespace refract
                 r.position = ls.startPos;
                 r.direction = 1;
             }
+
+            // Granular: no grains yet, start the first one straight away
+            ls.granular = (int) P.layers[(size_t) i].mode->load() == layerGranular;
+            for (auto& g : ls.grains) g.active = false;
+            ls.spawnCountdown = 0.0;
+            ls.scanOffset = 0.0;
         }
     }
 
@@ -270,8 +276,15 @@ namespace refract
             float pos = -1.0f;
             if (r.active && ls.data != nullptr)
             {
-                pos = (float) (r.position / (double) ls.data->audio.getNumSamples());
-                if (ls.reversed) pos = 1.0f - pos;   // show it on the forwards waveform
+                if (ls.granular)
+                {
+                    pos = (float) (ls.grainCentre / (double) ls.data->audio.getNumSamples());   // centre of the grain cloud
+                }
+                else
+                {
+                    pos = (float) (r.position / (double) ls.data->audio.getNumSamples());
+                    if (ls.reversed) pos = 1.0f - pos;   // show it on the forwards waveform
+                }
             }
             (*shared.playheads)[(size_t) i][(size_t) index].store (pos, std::memory_order_relaxed);
         }
@@ -442,7 +455,11 @@ namespace refract
                     panGains (layerPan + t * spread, r.panL, r.panR);
                 }
 
-                target = lp.on->load() > 0.5f ? v (lp.level) / std::sqrt ((float) copies) : 0.0f;
+                ls.granular = (int) lp.mode->load() == layerGranular;
+                if (ls.granular)
+                    updateGranular (ls, lp, layerPan, n);
+
+                target = lp.on->load() > 0.5f ? v (lp.level) / std::sqrt ((float) (ls.granular ? 1 : copies)) : 0.0f;
 
                 // The root note plays the sample at its original pitch; every
                 // semitone away from it speeds up or slows down playback.
@@ -573,6 +590,108 @@ namespace refract
         return mono;
     }
 
+    //==========================================================================
+    //  Granular mode
+    //==========================================================================
+    // Reads the grain settings for this block. Grains come from around the
+    // Position point (inside the Start..End markers); Scan moves that point
+    // through the sample on its own (1x = the sample's normal speed).
+    void RefractVoice::updateGranular (LayerState& ls, const ParamRefs::Layer& lp, float layerPan, int n)
+    {
+        const double len = (double) ls.data->audio.getNumSamples();
+        double s = v (lp.start) * len, e = v (lp.end) * len;
+        if (e < s) std::swap (s, e);
+        if (e - s < 64.0) e = juce::jmin (len - 1.0, s + 64.0);
+        ls.grainRegionStart = s;
+        ls.grainRegionEnd = e;
+
+        const bool frozen = lp.freeze->load() > 0.5f;
+        if (! frozen)
+            ls.scanOffset += (double) v (lp.grainScan) * (double) n * ls.increment / juce::jmax (1.0, e - s);
+        ls.scanOffset -= std::floor (ls.scanOffset);
+
+        double p = (double) v (lp.grainPos) + ls.scanOffset;
+        p -= std::floor (p);
+        ls.grainCentre = s + p * (e - s);
+
+        const double sizeSeconds = (double) v (lp.grainSize);
+        const double density = (double) juce::jmax (0.5f, v (lp.grainDensity));
+        ls.grainLength = juce::jlimit (32.0, len, sizeSeconds * sampleRate);
+        ls.grainInterval = sampleRate / density;
+        ls.grainSpray = v (lp.grainSpray);
+        ls.grainPitchRandom = v (lp.grainPitchRandom);
+        ls.grainShape = v (lp.grainShape);
+        ls.grainSpread = v (lp.grainSpread);
+        ls.grainReverse = v (lp.grainReverse);
+        ls.grainPan = layerPan;
+        // Overlapping grains add up; scale so density doesn't change the loudness much
+        ls.grainGain = 1.0f / std::sqrt ((float) juce::jmax (1.0, density * sizeSeconds));
+    }
+
+    void RefractVoice::spawnGrain (LayerState& ls, int layerIndex)
+    {
+        for (auto& g : ls.grains)
+        {
+            if (g.active)
+                continue;
+            const double len = (double) ls.data->audio.getNumSamples();
+            const double width = ls.grainRegionEnd - ls.grainRegionStart;
+            double start = ls.grainCentre + (double) ls.grainSpray * (random.nextDouble() - 0.5) * width;
+            start = juce::jlimit (0.0, len - 2.0, start);
+
+            const bool backwards = random.nextFloat() < ls.grainReverse;
+            const double detune = (double) ls.grainPitchRandom * (random.nextDouble() * 2.0 - 1.0);
+            g.rate = ls.increment * std::pow (2.0, detune / 12.0) * (backwards ? -1.0 : 1.0);
+            g.pos = start;
+            g.age = 0;
+            g.length = (int) ls.grainLength;
+            panGains (ls.grainPan + ls.grainSpread * (random.nextFloat() * 2.0f - 1.0f), g.panL, g.panR);
+            g.active = true;
+
+            // Tell the UI where it started
+            if (auto* marks = shared.grainMarks)
+            {
+                const int slot = marks->writeIndex[(size_t) layerIndex].fetch_add (1) & (numGrainMarks - 1);
+                marks->position[(size_t) layerIndex][(size_t) slot].store ((float) (start / len), std::memory_order_relaxed);
+            }
+            return;
+        }
+        // All grain slots busy: skip this one (very high density with long grains)
+    }
+
+    void RefractVoice::renderGrains (LayerState& ls, int layerIndex, float& left, float& right)
+    {
+        ls.spawnCountdown -= 1.0;
+        if (ls.spawnCountdown <= 0.0)
+        {
+            spawnGrain (ls, layerIndex);
+            ls.spawnCountdown += ls.grainInterval * (0.85 + 0.3 * random.nextDouble());   // a little irregular, like a real cloud
+        }
+
+        const auto& audio = ls.data->audio;
+        const double last = (double) audio.getNumSamples() - 2.0;
+        // Grain window: Shape 0 = smooth Hann bell, towards 1 = flat with short fades (punchier)
+        const float alpha = 1.0f - 0.9f * ls.grainShape;
+        const float g0 = ls.grainGain * ls.gain;
+
+        for (auto& g : ls.grains)
+        {
+            if (! g.active)
+                continue;
+            const float t = (float) g.age / (float) g.length;
+            float w = 1.0f;
+            if (t < alpha * 0.5f)               w = 0.5f * (1.0f - std::cos (juce::MathConstants<float>::twoPi * t / alpha));
+            else if (t > 1.0f - alpha * 0.5f)   w = 0.5f * (1.0f - std::cos (juce::MathConstants<float>::twoPi * (1.0f - t) / alpha));
+
+            left  += readSample (audio, 0, g.pos) * w * g.panL * g0;
+            right += readSample (audio, 1, g.pos) * w * g.panR * g0;
+
+            g.pos += g.rate;
+            if (++g.age >= g.length || g.pos < 0.0 || g.pos > last)
+                g.active = false;
+        }
+    }
+
     // 4-point cubic (Hermite) interpolation: reading "between" samples smoothly is
     // what lets us repitch a sample without the grainy sound of simple rounding.
     float RefractVoice::readSample (const juce::AudioBuffer<float>& buffer, int channel, double position)
@@ -625,6 +744,12 @@ namespace refract
                     ls.gain += ls.gainStep;
                     if (ls.data == nullptr)
                         continue;
+
+                    if (ls.granular)
+                    {
+                        renderGrains (ls, li, srcL[li], srcR[li]);
+                        continue;
+                    }
 
                     const auto& buf = ls.reversed ? ls.data->reversed : ls.data->audio;
                     const double loopLen = ls.loopEnd - ls.loopStart;

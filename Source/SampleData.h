@@ -90,4 +90,17 @@ namespace refract
     // (-1 = not playing). Written by the audio thread, read by the UI to draw
     // the moving playheads.
     using PlayheadArray = std::array<std::array<std::atomic<float>, numVoices>, numLayers>;
+
+    // Where recent grains started (0..1), per layer, so the UI can draw the
+    // grain cloud. A small ring buffer each voice writes into.
+    struct GrainMarks
+    {
+        std::array<std::array<std::atomic<float>, numGrainMarks>, numLayers> position;
+        std::array<std::atomic<int>, numLayers> writeIndex;
+        GrainMarks()
+        {
+            for (auto& l : position) for (auto& p : l) p.store (-1.0f);
+            for (auto& w : writeIndex) w.store (0);
+        }
+    };
 }

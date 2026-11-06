@@ -288,7 +288,7 @@ private:
 // Everything for one sample layer: the sample view, painting tools, and the
 // layer's tuning / region / loop controls.
 //==============================================================================
-class LayerPanel : public juce::Component
+class LayerPanel : public juce::Component, private juce::Timer
 {
 public:
     LayerPanel (RefractAudioProcessor& processor, int layer);
@@ -297,6 +297,7 @@ public:
     void paint (juce::Graphics&) override;
 
 private:
+    void timerCallback() override;   // swaps Classic / Granular controls
     void setView (SpectralEditor::View v);
     void detectPitch();
     void setParameter (const juce::String& id, float value);
@@ -314,7 +315,10 @@ private:
     juce::String detectedText;
 
     // Painting tools (only shown in the spectral view)
-    juce::TextButton resetMaskButton { "Reset Paint" }, invertMaskButton { "Invert" };
+    juce::TextButton resetMaskButton { "Reset" }, invertMaskButton { "Invert" };
+    juce::TextButton undoButton { "Undo" }, redoButton { "Redo" };
+    juce::ComboBox modeSelector;   // Classic / Granular
+    std::unique_ptr<APVTS::ComboBoxAttachment> modeAttachment;
     juce::ComboBox toolBox, modeBox;
     juce::Slider sizeSlider { juce::Slider::LinearHorizontal, juce::Slider::NoTextBox };
     juce::Slider strengthSlider { juce::Slider::LinearHorizontal, juce::Slider::NoTextBox };
@@ -330,6 +334,11 @@ private:
     Knob loopStart, loopEnd, crossfade;
     Toggle reverse;
     Knob unison, detune, spread;
+
+    // Granular controls
+    Knob grainPos, grainSize, grainDensity, grainSpray, grainPitch, grainShape, grainSpread, grainReverse, grainScan;
+    Toggle grainFreeze;
+    int shownMode = -1;
 
     std::unique_ptr<juce::FileChooser> chooser;
 };

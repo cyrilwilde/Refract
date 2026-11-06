@@ -25,10 +25,10 @@ namespace refract::spectral
             const int y1 = juce::jmin (y0 + 1, maskHeight - 1);
             const float fx = x - (float) x0, fy = y - (float) y0;
 
-            auto at = [&m] (int xx, int yy) { return (float) m[(size_t) (yy * maskWidth + xx)] * (1.0f / 255.0f); };
+            auto at = [&m] (int xx, int yy) { return (float) m[(size_t) (yy * maskWidth + xx)]; };
             const float bottom = at (x0, y0) + fx * (at (x1, y0) - at (x0, y0));
             const float top    = at (x0, y1) + fx * (at (x1, y1) - at (x0, y1));
-            return bottom + fy * (top - bottom);
+            return maskToGain (bottom + fy * (top - bottom));   // mask value -> gain
         }
 
         // JUCE's FFT backends may scale the inverse differently, so measure the
@@ -58,7 +58,7 @@ namespace refract::spectral
     bool isMaskEmpty (const Mask& mask)
     {
         for (auto v : mask)
-            if (v != 255)
+            if (v != (uint8_t) maskUnity)
                 return false;
         return true;
     }

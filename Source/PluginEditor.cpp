@@ -817,7 +817,17 @@ LayerPanel::LayerPanel (RefractAudioProcessor& p, int layerIndex)
       reverse   (p.apvts, ids::layer (layerIndex, "reverse"),   "Reverse"),
       unison    (p.apvts, ids::layer (layerIndex, "unison"),    "Unison"),
       detune    (p.apvts, ids::layer (layerIndex, "detune"),    "Detune"),
-      spread    (p.apvts, ids::layer (layerIndex, "spread"),    "Spread")
+      spread    (p.apvts, ids::layer (layerIndex, "spread"),    "Spread"),
+      grainPos     (p.apvts, ids::layer (layerIndex, "gpos"),    "Position"),
+      grainSize    (p.apvts, ids::layer (layerIndex, "gsize"),   "Size"),
+      grainDensity (p.apvts, ids::layer (layerIndex, "gdens"),   "Density"),
+      grainSpray   (p.apvts, ids::layer (layerIndex, "gspray"),  "Spray"),
+      grainPitch   (p.apvts, ids::layer (layerIndex, "gprnd"),   "Rnd Pitch"),
+      grainShape   (p.apvts, ids::layer (layerIndex, "gshape"),  "Shape"),
+      grainSpread  (p.apvts, ids::layer (layerIndex, "gspread"), "Spread"),
+      grainReverse (p.apvts, ids::layer (layerIndex, "grev"),    "Reverse"),
+      grainScan    (p.apvts, ids::layer (layerIndex, "gscan"),   "Scan", true),
+      grainFreeze  (p.apvts, ids::layer (layerIndex, "gfreeze"), "Freeze")
 {
     addAndMakeVisible (spectral);
 
@@ -826,8 +836,24 @@ LayerPanel::LayerPanel (RefractAudioProcessor& p, int layerIndex)
              &resetMaskButton, &invertMaskButton, &toolBox, &modeBox, &sizeSlider, &strengthSlider,
              &sizeLabel, &strengthLabel,
              &on, &level, &pan, &root, &transpose, &fine, &detectButton, &start, &end,
-             &loopMode, &loopStart, &loopEnd, &crossfade, &reverse, &unison, &detune, &spread })
+             &loopMode, &loopStart, &loopEnd, &crossfade, &reverse, &unison, &detune, &spread,
+             &undoButton, &redoButton, &modeSelector })
         addAndMakeVisible (c);
+    for (auto* c : std::initializer_list<juce::Component*> { &grainPos, &grainSize, &grainDensity, &grainSpray, &grainPitch,
+                                                              &grainShape, &grainSpread, &grainReverse, &grainScan, &grainFreeze })
+        addChildComponent (c);
+
+    // Classic / Granular
+    addChoices (modeSelector, p.apvts, ids::layer (layerIndex, "mode"));
+    modeAttachment = std::make_unique<APVTS::ComboBoxAttachment> (p.apvts, ids::layer (layerIndex, "mode"), modeSelector);
+    modeSelector.setTooltip ("Classic: play the sample like Sampler. Granular: play it as a cloud of tiny grains.");
+    grainPos.slider.setTooltip ("Where in the sample the grains come from (or drag the G marker)");
+    grainDensity.slider.setTooltip ("How many grains start per second");
+    grainSpray.slider.setTooltip ("Randomly scatters where each grain starts, around Position");
+    grainShape.slider.setTooltip ("0 = smooth, soft grains. Towards 1 = flatter, punchier grains.");
+    grainReverse.slider.setTooltip ("Chance of each grain playing backwards");
+    grainScan.slider.setTooltip ("Moves Position through the sample on its own (1x = normal speed, negative = backwards)");
+    grainFreeze.button.setTooltip ("Hold Position still, ignoring Scan");
 
     fileLabel.setColour (juce::Label::textColourId, colours::text);
     fileLabel.setMinimumHorizontalScale (0.6f);
@@ -861,15 +887,17 @@ LayerPanel::LayerPanel (RefractAudioProcessor& p, int layerIndex)
     snapButton.setTooltip ("Snap markers to zero crossings, so cuts and loops don't click");
 
     // --- Painting tools ----------------------------------------------------
-    toolBox.addItemList ({ "Brush", "Rectangle" }, 1);
+    toolBox.addItemList (SpectralEditor::toolNames(), 1);
     toolBox.setSelectedId (1, juce::dontSendNotification);
-    toolBox.onChange = [this] { spectral.setTool (toolBox.getSelectedId() == 1 ? SpectralEditor::Tool::brush
-                                                                               : SpectralEditor::Tool::rectangle); };
+    toolBox.onChange = [this] { spectral.setTool (static_cast<SpectralEditor::Tool> (toolBox.getSelectedId() - 1)); };
+    toolBox.setTooltip ("Brushes paint as you drag. Rectangle / Ellipse / Heart: drag out a box.");
 
-    modeBox.addItemList ({ "Remove", "Restore" }, 1);
+    modeBox.addItemList (SpectralEditor::modeNames(), 1);
     modeBox.setSelectedId (1, juce::dontSendNotification);
-    modeBox.onChange = [this] { spectral.setMode (modeBox.getSelectedId() == 1 ? SpectralEditor::Mode::remove
-                                                                               : SpectralEditor::Mode::restore); };
+    modeBox.onChange = [this] { spectral.setMode (static_cast<SpectralEditor::Mode> (modeBox.getSelectedId() - 1)); };
+
+    undoButton.onClick = [this] { spectral.undo(); };
+    redoButton.onClick = [this] { spectral.redo(); };
     modeBox.setTooltip ("Right-drag always does the opposite");
 
     sizeSlider.setRange (3.0, 60.0);
@@ -885,15 +913,18 @@ LayerPanel::LayerPanel (RefractAudioProcessor& p, int layerIndex)
 
     resetMaskButton.onClick = [this]
     {
+        spectral.pushUndo();
         auto& mask = processor.getMask (layer);
-        std::fill (mask.begin(), mask.end(), (uint8_t) 255);
+        std::fill (mask.begin(), mask.end(), (uint8_t) maskUnity);
         spectral.rebuildOverlay();
         processor.maskEdited (layer);
     };
     invertMaskButton.onClick = [this]
     {
+        // Kept becomes removed and removed becomes kept (boosts count as kept)
+        spectral.pushUndo();
         for (auto& v : processor.getMask (layer))
-            v = (uint8_t) (255 - v);
+            v = (uint8_t) (v >= maskUnity ? 0 : maskUnity - v);
         spectral.rebuildOverlay();
         processor.maskEdited (layer);
     };
@@ -904,6 +935,18 @@ LayerPanel::LayerPanel (RefractAudioProcessor& p, int layerIndex)
 
     setView (SpectralEditor::View::waveform);
     refresh();
+    timerCallback();
+    startTimerHz (8);
+}
+
+void LayerPanel::timerCallback()
+{
+    const int m = (int) processor.apvts.getRawParameterValue (ids::layer (layer, "mode"))->load();
+    if (m != shownMode)
+    {
+        shownMode = m;
+        resized();   // swaps the row of controls
+    }
 }
 
 void LayerPanel::setView (SpectralEditor::View v)
@@ -914,7 +957,8 @@ void LayerPanel::setView (SpectralEditor::View v)
 
     const bool paintTools = v == SpectralEditor::View::spectral;
     for (auto* c : std::initializer_list<juce::Component*> { &resetMaskButton, &invertMaskButton, &toolBox, &modeBox,
-                                                              &sizeSlider, &strengthSlider, &sizeLabel, &strengthLabel })
+                                                              &sizeSlider, &strengthSlider, &sizeLabel, &strengthLabel,
+                                                              &undoButton, &redoButton })
         c->setVisible (paintTools);
 }
 
@@ -987,29 +1031,35 @@ void LayerPanel::resized()
     bar.removeFromLeft (4);
     fitButton.setBounds (bar.removeFromLeft (40));
     bar.removeFromLeft (6);
-    snapButton.setBounds (bar.removeFromLeft (62));
+    snapButton.setBounds (bar.removeFromLeft (58));
+    bar.removeFromLeft (4);
+    modeSelector.setBounds (bar.removeFromLeft (92));
     bar.removeFromLeft (8);
 
-    invertMaskButton.setBounds (bar.removeFromRight (56));
+    redoButton.setBounds (bar.removeFromRight (44));
+    undoButton.setBounds (bar.removeFromRight (44));
     bar.removeFromRight (4);
-    resetMaskButton.setBounds (bar.removeFromRight (84));
-    bar.removeFromRight (8);
-    strengthSlider.setBounds (bar.removeFromRight (70));
-    strengthLabel.setBounds (bar.removeFromRight (54));
-    sizeSlider.setBounds (bar.removeFromRight (70));
-    sizeLabel.setBounds (bar.removeFromRight (32));
+    invertMaskButton.setBounds (bar.removeFromRight (50));
+    resetMaskButton.setBounds (bar.removeFromRight (50));
+    bar.removeFromRight (6);
+    strengthSlider.setBounds (bar.removeFromRight (56));
+    strengthLabel.setBounds (bar.removeFromRight (50));
+    sizeSlider.setBounds (bar.removeFromRight (56));
+    sizeLabel.setBounds (bar.removeFromRight (30));
     bar.removeFromRight (4);
-    modeBox.setBounds (bar.removeFromRight (86));
+    modeBox.setBounds (bar.removeFromRight (78));
     bar.removeFromRight (4);
-    toolBox.setBounds (bar.removeFromRight (96));
+    toolBox.setBounds (bar.removeFromRight (104));
     bar.removeFromRight (8);
     fileLabel.setBounds (bar);
 
     area.removeFromTop (6);
 
-    // Layer controls along the bottom, in groups
+    // Layer controls along the bottom, in groups. Granular swaps the loop and
+    // unison controls for the grain controls.
+    const bool granular = shownMode == layerGranular;
     auto controls = area.removeFromBottom (74);
-    const int w = controls.getWidth() / 18;
+    const int w = controls.getWidth() / (granular ? 21 : 18);
     auto place = [&] (juce::Component& c) { c.setBounds (controls.removeFromLeft (w).reduced (2, 0)); };
     auto gap = [&] { controls.removeFromLeft (w / 4); };
 
@@ -1017,9 +1067,24 @@ void LayerPanel::resized()
     place (root); place (transpose); place (fine);
     detectButton.setBounds (controls.removeFromLeft (w).withSizeKeepingCentre (w - 6, 24)); gap();
     place (start); place (end); gap();
-    place (loopMode); place (loopStart); place (loopEnd); place (crossfade);
-    place (reverse); gap();
-    place (unison); place (detune); place (spread);
+
+    for (auto* c : std::initializer_list<juce::Component*> { &loopMode, &loopStart, &loopEnd, &crossfade, &reverse, &unison, &detune, &spread })
+        c->setVisible (! granular);
+    for (auto* c : std::initializer_list<juce::Component*> { &grainPos, &grainSize, &grainDensity, &grainSpray, &grainPitch,
+                                                              &grainShape, &grainSpread, &grainReverse, &grainScan, &grainFreeze })
+        c->setVisible (granular);
+
+    if (granular)
+    {
+        place (grainPos); place (grainSize); place (grainDensity); place (grainSpray); place (grainPitch);
+        place (grainShape); place (grainSpread); place (grainReverse); place (grainScan); place (grainFreeze);
+    }
+    else
+    {
+        place (loopMode); place (loopStart); place (loopEnd); place (crossfade);
+        place (reverse); gap();
+        place (unison); place (detune); place (spread);
+    }
 
     area.removeFromBottom (6);
     spectral.setBounds (area);

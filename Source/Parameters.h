@@ -29,6 +29,20 @@ namespace refract
 
     constexpr double maxSampleSeconds = 30.0;   // longer files are trimmed on load
 
+    // Mask values: 0 = removed, maskUnity = untouched, 255 = boosted by +12 dB
+    constexpr int maskUnity = 200;
+    inline float maskToGain (float m)   // m in 0..255
+    {
+        return m <= (float) maskUnity ? m / (float) maskUnity
+                                      : 1.0f + (m - (float) maskUnity) / (float) (255 - maskUnity) * 3.0f;
+    }
+
+    // Layer playback modes
+    enum LayerMode { layerClassic = 0, layerGranular };
+    inline juce::StringArray layerModeNames() { return { "Classic", "Granular" }; }
+    constexpr int maxGrains = 24;        // per layer, per voice
+    constexpr int numGrainMarks = 64;    // recent grain positions shown in the sample view
+
     // 0..1 position on the log axis  <->  frequency in Hz
     inline float logPosToFreq (float p) { return minMaskFreq * std::pow (maxMaskFreq / minMaskFreq, p); }
     inline float freqToLogPos (float f)
@@ -185,6 +199,9 @@ namespace refract
             P on, loopMode, reverse;
             I level, pan, root, coarse, fine, start, end, loopStart, loopEnd, crossfade;
             I unison, detune, spread;
+            // Granular
+            P mode, freeze;
+            I grainPos, grainSize, grainDensity, grainSpray, grainPitchRandom, grainShape, grainSpread, grainReverse, grainScan;
         };
         struct Osc
         {

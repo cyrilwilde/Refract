@@ -70,6 +70,7 @@ public:
 
     // Where each voice currently is in a layer's sample (0..1, or -1 if silent)
     float getPlayhead (int layer, int voice) const { return playheads[(size_t) layer][(size_t) voice].load (std::memory_order_relaxed); }
+    float getGrainMark (int layer, int index) const { return grainMarks.position[(size_t) layer][(size_t) index].load (std::memory_order_relaxed); }
 
     // Estimates the pitch of a layer's sample as a (fractional) MIDI note,
     // or returns -1 if no clear pitch was found.
@@ -147,6 +148,7 @@ private:
     refract::PlaybackBank bank;
     refract::WavetableBank wavetables;
     refract::PlayheadArray playheads;
+    refract::GrainMarks grainMarks;
     refract::VoiceShared shared;
     refract::RefractSynth synth;
 
