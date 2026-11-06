@@ -18,17 +18,28 @@ namespace
         if (auto* p = dynamic_cast<juce::AudioParameterChoice*> (state.getParameter (paramId)))
             box.addItemList (p->choices, 1);   // items must exist before the attachment is made
     }
+
+    void drawPanel (juce::Graphics& g, juce::Rectangle<float> r)
+    {
+        g.setColour (colours::panel);
+        g.fillRoundedRectangle (r, 8.0f);
+        g.setColour (colours::panelEdge);
+        g.drawRoundedRectangle (r, 8.0f, 1.0f);
+    }
 }
 
 //==============================================================================
+//  Knob
+//==============================================================================
 Knob::Knob (APVTS& state, const juce::String& paramId, const juce::String& text, bool bipolar)
     : slider (juce::Slider::RotaryHorizontalVerticalDrag, juce::Slider::TextBoxBelow),
-      attachment (state, paramId, slider)
+      attachment (state, paramId, slider),
+      parameter (state.getParameter (paramId))
 {
     slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 72, 16);
     slider.getProperties().set ("bipolar", bipolar);
-    slider.setDoubleClickReturnValue (true, (double) state.getParameter (paramId)->convertFrom0to1 (
-                                                state.getParameter (paramId)->getDefaultValue()));
+    slider.setDoubleClickReturnValue (true, (double) parameter->convertFrom0to1 (parameter->getDefaultValue()));
+    slider.onRightClick = [this] { showModMenu(); };
     styleLabel (label, text);
     addAndMakeVisible (slider);
     addAndMakeVisible (label);
@@ -41,6 +52,50 @@ void Knob::resized()
     slider.setBounds (r);
 }
 
+void Knob::setModContext (RefractAudioProcessor* p)
+{
+    processor = p;
+    modTarget = p != nullptr ? p->getParamTable().indexOf (parameter->getParameterID()) : -1;
+    if (modTarget >= 0)
+        slider.setTooltip ("Right-click to modulate");
+}
+
+void Knob::showModMenu()
+{
+    if (processor == nullptr || modTarget < 0)
+        return;
+
+    const auto names = modSourceNames();
+    juce::PopupMenu sources;
+    for (int s = 1; s < numModSources; ++s)
+        sources.addItem (100 + s, names[s]);
+
+    juce::PopupMenu menu;
+    menu.addSectionHeader (parameter->getName (40));
+    menu.addSubMenu ("Modulate with", sources);
+
+    // Existing routes into this dial can be removed from here too
+    bool any = false;
+    for (int slot = 0; slot < numModSlots; ++slot)
+        if (processor->getModTarget (slot) == modTarget && processor->getModSource (slot) != srcNone)
+        {
+            if (! any) menu.addSeparator();
+            any = true;
+            menu.addItem (200 + slot, "Remove " + names[processor->getModSource (slot)]
+                                      + " (matrix row " + juce::String (slot + 1) + ")");
+        }
+
+    juce::Component::SafePointer<Knob> safe (this);
+    menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&slider), [safe] (int result)
+    {
+        if (safe == nullptr || result == 0) return;
+        auto* p = safe->processor;
+        if (result >= 200)       p->clearModSlot (result - 200);
+        else if (result >= 100)  p->addModulation (result - 100, safe->modTarget);
+    });
+}
+
+//==============================================================================
 Choice::Choice (APVTS& state, const juce::String& paramId, const juce::String& text)
 {
     addChoices (box, state, paramId);
@@ -66,12 +121,7 @@ Toggle::Toggle (APVTS& state, const juce::String& paramId, const juce::String& t
 //==============================================================================
 void Section::paint (juce::Graphics& g)
 {
-    const auto r = getLocalBounds().toFloat().reduced (1.0f);
-    g.setColour (colours::panel);
-    g.fillRoundedRectangle (r, 8.0f);
-    g.setColour (colours::panelEdge);
-    g.drawRoundedRectangle (r, 8.0f, 1.0f);
-
+    drawPanel (g, getLocalBounds().toFloat().reduced (1.0f));
     g.setColour (colours::dimText);
     g.setFont (juce::Font (juce::FontOptions (11.0f, juce::Font::bold)));
     g.drawText (title, getLocalBounds().reduced (10, 6).removeFromTop (14), juce::Justification::left);
@@ -82,46 +132,267 @@ void Section::resized()
     if (items.empty())
         return;
     auto area = getContentArea();
-    const int w = area.getWidth() / (int) items.size();
-    for (auto& c : items)
-        c->setBounds (area.removeFromLeft (w).reduced (2));
+    const int perRow = ((int) items.size() + numRows - 1) / numRows;
+    const int rowH = area.getHeight() / numRows;
+    const int w = area.getWidth() / perRow;
+    for (int i = 0; i < (int) items.size(); ++i)
+    {
+        const int row = i / perRow, col = i % perRow;
+        items[(size_t) i]->setBounds (juce::Rectangle<int> (area.getX() + col * w, area.getY() + row * rowH, w, rowH).reduced (2));
+    }
 }
 
 //==============================================================================
-ModMatrixSection::ModMatrixSection (APVTS& state) : Section ("MOD MATRIX")
+//  LFO scope and panel
+//==============================================================================
+void LfoScope::paint (juce::Graphics& g)
+{
+    const auto r = getLocalBounds().toFloat().reduced (2.0f);
+    g.setColour (colours::background);
+    g.fillRoundedRectangle (r, 4.0f);
+    g.setColour (colours::panelEdge);
+    g.drawHorizontalLine ((int) r.getCentreY(), r.getX(), r.getRight());
+
+    auto& s = processor.apvts;
+    const int shape    = (int) s.getRawParameterValue (ids::lfo (lfo, "shape"))->load();
+    const float depth  = s.getRawParameterValue (ids::lfo (lfo, "depth"))->load();
+    const float smooth = s.getRawParameterValue (ids::lfo (lfo, "smooth"))->load();
+    const float phase0 = s.getRawParameterValue (ids::lfo (lfo, "phase"))->load();
+
+    // Draw two cycles of the shape, with a preview of the smoothing
+    static const float randomSteps[] = { 0.6f, -0.3f, 0.9f, -0.8f, 0.2f, -0.5f };
+    const int points = juce::jmax (2, (int) r.getWidth());
+    const float coef = smooth <= 0.0001f ? 1.0f : (float) (1.0 - std::exp (-1.0 / (smooth * smooth * 0.5 * points / 2.0)));
+    juce::Path path;
+    float y = 0.0f;
+    for (int i = 0; i < points; ++i)
+    {
+        const float t = (float) i / (float) (points - 1) * 2.0f + phase0;
+        const float p = t - std::floor (t);
+        float raw;
+        switch (shape)
+        {
+            case lfoSine:     raw = std::sin (juce::MathConstants<float>::twoPi * p); break;
+            case lfoTriangle: raw = 1.0f - 4.0f * std::abs (p - 0.5f); break;
+            case lfoSawUp:    raw = 2.0f * p - 1.0f; break;
+            case lfoSawDown:  raw = 1.0f - 2.0f * p; break;
+            case lfoSquare:   raw = p < 0.5f ? 1.0f : -1.0f; break;
+            default:          raw = randomSteps[(int) std::floor (t * 2.0f) % 6]; break;   // a made-up random pattern
+        }
+        y = i == 0 ? raw : y + (raw - y) * coef;
+        const float py = r.getCentreY() - y * depth * r.getHeight() * 0.42f;
+        const float px = r.getX() + (float) i;
+        if (i == 0) path.startNewSubPath (px, py); else path.lineTo (px, py);
+    }
+    g.setColour (colours::waveform);
+    g.strokePath (path, juce::PathStrokeType (1.5f));
+
+    // Where the LFO is right now (newest note, or the free-running LFO)
+    const float live = processor.getLiveSource (srcLfo1 + lfo);
+    const float ly = r.getCentreY() - live * r.getHeight() * 0.42f;
+    g.setColour (colours::modulation);
+    g.drawHorizontalLine ((int) ly, r.getX(), r.getRight());
+    g.fillEllipse (r.getRight() - 9.0f, ly - 4.0f, 8.0f, 8.0f);
+}
+
+LfoPanel::LfoPanel (RefractAudioProcessor& p, int lfoIndex)
+    : processor (p), lfo (lfoIndex),
+      shape  (p.apvts, ids::lfo (lfoIndex, "shape"),  "Shape"),
+      mode   (p.apvts, ids::lfo (lfoIndex, "mode"),   "Rate Mode"),
+      rate   (p.apvts, ids::lfo (lfoIndex, "rate"),   "Rate"),
+      sync   (p.apvts, ids::lfo (lfoIndex, "sync"),   "Sync"),
+      ratio  (p.apvts, ids::lfo (lfoIndex, "ratio"),  "Ratio"),
+      depth  (p.apvts, ids::lfo (lfoIndex, "depth"),  "Depth"),
+      phase  (p.apvts, ids::lfo (lfoIndex, "phase"),  "Phase"),
+      jitter (p.apvts, ids::lfo (lfoIndex, "jitter"), "Jitter"),
+      smooth (p.apvts, ids::lfo (lfoIndex, "smooth"), "Smooth"),
+      retrig (p.apvts, ids::lfo (lfoIndex, "retrig"), "Retrigger"),
+      scope  (p, lfoIndex)
+{
+    for (auto* c : std::initializer_list<juce::Component*> { &shape, &mode, &rate, &sync, &ratio, &depth, &phase,
+                                                              &jitter, &smooth, &retrig, &scope })
+        addAndMakeVisible (c);
+    retrig.button.setTooltip ("On: every note restarts the LFO at its Phase. Off: all notes share one free-running LFO.");
+    jitter.slider.setTooltip ("Randomly stretches or squeezes each cycle (up to an octave)");
+    smooth.slider.setTooltip ("Rounds off sharp edges - turns Random steps into slow drifting curves");
+    timerCallback();
+    startTimerHz (10);
+}
+
+void LfoPanel::timerCallback()
+{
+    const int m = (int) processor.apvts.getRawParameterValue (ids::lfo (lfo, "mode"))->load();
+    if (m == shownMode) return;
+    shownMode = m;
+    rate.setVisible (m == rateHz);
+    sync.setVisible (m == rateSync);
+    ratio.setVisible (m == rateFreq);
+}
+
+void LfoPanel::resized()
+{
+    auto area = getLocalBounds();
+    auto top = area.removeFromTop (area.getHeight() / 2);
+    auto bottom = area;
+
+    // Top row: shape, mode, rate (one of three), depth, phase
+    const int w = top.getWidth() / 5;
+    shape.setBounds (top.removeFromLeft (w).reduced (2));
+    mode.setBounds (top.removeFromLeft (w).reduced (2));
+    const auto rateSlot = top.removeFromLeft (w).reduced (2);
+    rate.setBounds (rateSlot); sync.setBounds (rateSlot); ratio.setBounds (rateSlot);
+    depth.setBounds (top.removeFromLeft (w).reduced (2));
+    phase.setBounds (top.reduced (2));
+
+    // Bottom row: jitter, smooth, retrigger, scope
+    jitter.setBounds (bottom.removeFromLeft (w).reduced (2));
+    smooth.setBounds (bottom.removeFromLeft (w).reduced (2));
+    retrig.setBounds (bottom.removeFromLeft (w).reduced (2));
+    scope.setBounds (bottom.reduced (4, 6));
+}
+
+//==============================================================================
+TabbedSection::TabbedSection (const juce::String& t, const juce::StringArray& tabNames, int radioGroup)
+    : Section (t)
+{
+    for (const auto& name : tabNames)
+    {
+        auto* b = tabs.add (new juce::TextButton (name));
+        b->setClickingTogglesState (true);
+        b->setRadioGroupId (radioGroup);
+        const int i = tabs.size() - 1;
+        b->onClick = [this, i] { show (i); };
+        addAndMakeVisible (b);
+    }
+}
+
+void TabbedSection::addPanel (std::unique_ptr<juce::Component> panel)
+{
+    addChildComponent (*panel);
+    panels.push_back (std::move (panel));
+    if (panels.size() == 1) show (0);
+}
+
+void TabbedSection::show (int index)
+{
+    for (int i = 0; i < tabs.size(); ++i)
+        tabs[i]->setToggleState (i == index, juce::dontSendNotification);
+    for (size_t i = 0; i < panels.size(); ++i)
+        panels[i]->setVisible ((int) i == index);
+}
+
+void TabbedSection::resized()
+{
+    auto area = getLocalBounds().reduced (8);
+    auto tabRow = area.removeFromTop (20).withTrimmedLeft (juce::jmin (140, area.getWidth() / 3));
+    const int w = juce::jmin (60, tabRow.getWidth() / juce::jmax (1, tabs.size()));
+    for (auto* t : tabs)
+        t->setBounds (tabRow.removeFromLeft (w).reduced (2, 0));
+    area.removeFromTop (4);
+    for (auto& p : panels)
+        p->setBounds (area);
+}
+
+//==============================================================================
+//  Mod matrix page
+//==============================================================================
+ModMatrixPage::ModMatrixPage (RefractAudioProcessor& p) : processor (p)
+{
+    const auto& table = p.getParamTable();
+    const auto sourceNames = modSourceNames();
+
+    for (int i = 0; i < numModSlots; ++i)
+    {
+        auto& row = rows[(size_t) i];
+        styleLabel (row.number, juce::String (i + 1));
+
+        // Sources: item ID = source number + 1
+        for (int s = 0; s < numModSources; ++s)
+            row.source.addItem (sourceNames[s], s + 1);
+
+        // Destinations: grouped into sub-menus by section. Item ID = table index + 2 (1 = None)
+        row.target.addItem ("None", 1);
+        juce::StringArray groups;
+        for (int t = 0; t < table.size(); ++t)
+            groups.addIfNotAlreadyThere (table[t].group);
+        for (const auto& group : groups)
+        {
+            juce::PopupMenu sub;
+            for (int t = 0; t < table.size(); ++t)
+                if (table[t].group == group)
+                    sub.addItem (t + 2, table[t].name);
+            row.target.getRootMenu()->addSubMenu (group, sub);
+        }
+        row.target.setTextWhenNothingSelected ("None");
+
+        row.source.onChange = [this, i]
+        {
+            auto& r = rows[(size_t) i];
+            processor.setModRouting (i, r.source.getSelectedId() - 1, processor.getModTarget (i));
+        };
+        row.target.onChange = [this, i]
+        {
+            auto& r = rows[(size_t) i];
+            processor.setModRouting (i, processor.getModSource (i), r.target.getSelectedId() - 2);
+        };
+
+        row.amountAttachment = std::make_unique<APVTS::SliderAttachment> (p.apvts, ids::modAmount (i), row.amount);
+        row.amount.setTextBoxStyle (juce::Slider::TextBoxRight, false, 46, 18);
+        row.amount.setDoubleClickReturnValue (true, 0.0);
+        row.amount.setTooltip ("Amount: +/-1 = the full travel of the destination knob. Shift-drag for fine control.");
+
+        row.clear.setTooltip ("Clear this row");
+        row.clear.onClick = [this, i] { processor.clearModSlot (i); };
+
+        for (auto* c : std::initializer_list<juce::Component*> { &row.number, &row.source, &row.target, &row.amount, &row.clear })
+            addAndMakeVisible (c);
+    }
+    refresh();
+}
+
+void ModMatrixPage::refresh()
 {
     for (int i = 0; i < numModSlots; ++i)
     {
         auto& row = rows[(size_t) i];
-        addChoices (row.source, state, ids::mod (i, "src"));
-        addChoices (row.dest,   state, ids::mod (i, "dst"));
-        row.sourceAttachment = std::make_unique<APVTS::ComboBoxAttachment> (state, ids::mod (i, "src"), row.source);
-        row.destAttachment   = std::make_unique<APVTS::ComboBoxAttachment> (state, ids::mod (i, "dst"), row.dest);
-        row.amountAttachment = std::make_unique<APVTS::SliderAttachment>   (state, ids::mod (i, "amt"), row.amount);
-
-        row.amount.setTextBoxStyle (juce::Slider::TextBoxRight, false, 44, 18);
-        row.amount.setDoubleClickReturnValue (true, 0.0);
-
-        addAndMakeVisible (row.source);
-        addAndMakeVisible (row.dest);
-        addAndMakeVisible (row.amount);
+        row.source.setSelectedId (processor.getModSource (i) + 1, juce::dontSendNotification);
+        const int t = processor.getModTarget (i);
+        row.target.setSelectedId (t >= 0 ? t + 2 : 1, juce::dontSendNotification);
     }
 }
 
-void ModMatrixSection::resized()
+void ModMatrixPage::paint (juce::Graphics& g)
 {
-    auto area = getContentArea();
-    const int rowH = area.getHeight() / numModSlots;
-    for (auto& row : rows)
+    drawPanel (g, getLocalBounds().toFloat().reduced (1.0f));
+    g.setColour (colours::dimText);
+    g.setFont (juce::Font (juce::FontOptions (11.0f, juce::Font::bold)));
+    auto header = getLocalBounds().reduced (10, 6).removeFromTop (14);
+    g.drawText ("MOD MATRIX     source  >  destination  x  amount        (or right-click any dial)", header, juce::Justification::left);
+}
+
+void ModMatrixPage::resized()
+{
+    auto area = getLocalBounds().reduced (10).withTrimmedTop (20);
+    const int half = numModSlots / 2;
+    auto columns = std::array<juce::Rectangle<int>, 2> { area.removeFromLeft (area.getWidth() / 2).withTrimmedRight (8), area.withTrimmedLeft (8) };
+    for (int i = 0; i < numModSlots; ++i)
     {
-        auto r = area.removeFromTop (rowH).reduced (0, 2);
-        const int third = r.getWidth() / 3;
-        row.source.setBounds (r.removeFromLeft (third).reduced (2, 0));
-        row.dest.setBounds (r.removeFromLeft (third).reduced (2, 0));
+        auto& col = columns[(size_t) (i / half)];
+        const int rowH = juce::jmin (36, (area.getHeight()) / half);
+        auto r = juce::Rectangle<int> (col.getX(), col.getY() + (i % half) * rowH, col.getWidth(), rowH).reduced (0, 3);
+        auto& row = rows[(size_t) i];
+        row.number.setBounds (r.removeFromLeft (22));
+        row.clear.setBounds (r.removeFromRight (24));
+        r.removeFromRight (4);
+        const int w = r.getWidth();
+        row.source.setBounds (r.removeFromLeft (w * 28 / 100).reduced (2, 0));
+        row.target.setBounds (r.removeFromLeft (w * 36 / 100).reduced (2, 0));
         row.amount.setBounds (r.reduced (2, 0));
     }
 }
 
+//==============================================================================
+//  Layer panel
 //==============================================================================
 LayerPanel::LayerPanel (RefractAudioProcessor& p, int layerIndex)
     : processor (p), layer (layerIndex), spectral (p, layerIndex),
@@ -345,8 +616,12 @@ void LayerPanel::resized()
 }
 
 //==============================================================================
+//  The editor window
+//==============================================================================
 RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor& p)
-    : AudioProcessorEditor (&p), processor (p), matrix (p.apvts)
+    : AudioProcessorEditor (&p), processor (p), matrixPage (p),
+      lfoSection ("LFO", { "1", "2", "3", "4" }, 3001),
+      envSection ("ENVELOPE", { "2", "3", "4" }, 3002)
 {
     setLookAndFeel (&lookAndFeel);
     auto& s = p.apvts;
@@ -365,28 +640,35 @@ RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor&
         addChildComponent (*panels[(size_t) i]);
     }
 
+    // Page tabs for the bottom half
+    const char* pageNames[] = { "MAIN", "MODULATION", "MATRIX" };
+    for (int i = 0; i < 3; ++i)
+    {
+        auto& tab = pageTabs[(size_t) i];
+        tab.setButtonText (pageNames[i]);
+        tab.setClickingTogglesState (true);
+        tab.setRadioGroupId (1002);
+        tab.onClick = [this, i] { showPage (i); };
+        addAndMakeVisible (tab);
+    }
+
+    // --- Main page ---
     sub.add<Knob>   (s, "sub_level", "Level");
     sub.add<Choice> (s, "sub_octave", "Octave");
     sub.add<Choice> (s, "sub_wave", "Wave");
 
-    using EnvSection = std::pair<Section*, const char*>;
-    for (auto [section, prefix] : { EnvSection { &ampEnv, "amp" }, EnvSection { &modEnv, "env2" } })
-    {
-        const juce::String pre (prefix);
-        section->add<Knob> (s, pre + "_a", "Attack");
-        section->add<Knob> (s, pre + "_d", "Decay");
-        section->add<Knob> (s, pre + "_s", "Sustain");
-        section->add<Knob> (s, pre + "_r", "Release");
-    }
+    ampEnv.add<Knob> (s, ids::env (0, "a"), "Attack");
+    ampEnv.add<Knob> (s, ids::env (0, "d"), "Decay");
+    ampEnv.add<Knob> (s, ids::env (0, "s"), "Sustain");
+    ampEnv.add<Knob> (s, ids::env (0, "r"), "Release");
 
     filter.add<Choice> (s, "flt_type", "Type");
     filter.add<Knob>   (s, "flt_cutoff", "Cutoff");
     filter.add<Knob>   (s, "flt_res", "Resonance");
 
-    lfo1.add<Knob>   (s, "lfo1_rate", "Rate");
-    lfo1.add<Choice> (s, "lfo1_shape", "Shape");
-    lfo2.add<Knob>   (s, "lfo2_rate", "Rate");
-    lfo2.add<Choice> (s, "lfo2_shape", "Shape");
+    voice.add<Knob> (s, "voice_pitch", "Pitch", true);
+    voice.add<Knob> (s, "voice_pan", "Pan", true);
+    voice.add<Knob> (s, "voice_level", "Level");
 
     delay.add<Knob> (s, "dly_time", "Time");
     delay.add<Knob> (s, "dly_fb", "Feedback");
@@ -396,21 +678,62 @@ RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor&
     reverb.add<Knob> (s, "rev_damp", "Damping");
     reverb.add<Knob> (s, "rev_mix", "Mix");
 
+    for (int m = 0; m < numMacros; ++m)
+        macros.add<Knob> (s, ids::macro (m), "Macro " + juce::String (m + 1));
+
     output.add<Knob> (s, "master", "Master");
 
-    for (auto* c : std::initializer_list<juce::Component*> { &sub, &ampEnv, &modEnv, &filter, &lfo1, &lfo2,
-                                                              &matrix, &delay, &reverb, &output })
-        addAndMakeVisible (c);
+    for (auto* c : std::initializer_list<juce::Component*> { &sub, &ampEnv, &filter, &voice, &delay, &reverb, &macros, &output })
+        mainPage.addAndMakeVisible (c);
+
+    // --- Modulation page ---
+    for (int k = 0; k < numLfos; ++k)
+        lfoSection.addPanel (std::make_unique<LfoPanel> (p, k));
+
+    for (int e = 1; e < numEnvs; ++e)
+    {
+        auto env = std::make_unique<Section> ("", 1);
+        env->add<Knob> (s, ids::env (e, "a"), "Attack");
+        env->add<Knob> (s, ids::env (e, "d"), "Decay");
+        env->add<Knob> (s, ids::env (e, "s"), "Sustain");
+        env->add<Knob> (s, ids::env (e, "r"), "Release");
+        envSection.addPanel (std::move (env));
+    }
+    modPage.addAndMakeVisible (lfoSection);
+    modPage.addAndMakeVisible (envSection);
+
+    addChildComponent (mainPage);
+    addChildComponent (modPage);
+    addChildComponent (matrixPage);
+
+    // Every dial gets its modulation ring and right-click menu
+    collectKnobs (*this);
+    for (auto* k : knobs)
+        k->setModContext (&processor);
 
     processor.addChangeListener (this);
     showLayer (0);
+    showPage (0);
     setSize (1140, 830);
+    startTimerHz (30);
 }
 
 RefractAudioProcessorEditor::~RefractAudioProcessorEditor()
 {
+    stopTimer();
     processor.removeChangeListener (this);
     setLookAndFeel (nullptr);
+}
+
+void RefractAudioProcessorEditor::collectKnobs (juce::Component& parent)
+{
+    for (auto* child : parent.getChildren())
+    {
+        if (auto* k = dynamic_cast<Knob*> (child))
+            knobs.push_back (k);
+        else
+            collectKnobs (*child);
+    }
 }
 
 void RefractAudioProcessorEditor::showLayer (int index)
@@ -422,11 +745,77 @@ void RefractAudioProcessorEditor::showLayer (int index)
     }
 }
 
+void RefractAudioProcessorEditor::showPage (int index)
+{
+    for (int i = 0; i < 3; ++i)
+        pageTabs[(size_t) i].setToggleState (i == index, juce::dontSendNotification);
+    mainPage.setVisible (index == 0);
+    modPage.setVisible (index == 1);
+    matrixPage.setVisible (index == 2);
+}
+
 void RefractAudioProcessorEditor::changeListenerCallback (juce::ChangeBroadcaster*)
 {
-    // The processor finished loading or rendering something - redraw.
+    // The processor finished loading/rendering, or the mod routing changed - redraw.
     for (auto& panel : panels)
         panel->refresh();
+    matrixPage.refresh();
+}
+
+void RefractAudioProcessorEditor::timerCallback()
+{
+    // Modulation rings. For each dial work out:
+    //  - the range the routed modulation *can* move it through (pale ring), and
+    //  - where the newest note's modulation has it right now (bright arc).
+    const auto& table = processor.getParamTable();
+    const bool noteActive = processor.isNoteActive();
+
+    for (auto* k : knobs)
+    {
+        const int t = k->getModTarget();
+        if (t < 0 || ! k->isShowing())
+            continue;
+
+        float lo = 0.0f, hi = 0.0f;
+        for (int slot = 0; slot < numModSlots; ++slot)
+        {
+            const int src = processor.getModSource (slot);
+            if (processor.getModTarget (slot) != t || src == srcNone)
+                continue;
+            const float a = processor.apvts.getRawParameterValue (ids::modAmount (slot))->load();
+            if (isBipolarSource (src)) { lo -= std::abs (a); hi += std::abs (a); }
+            else if (a > 0.0f)         hi += a;
+            else                       lo += a;
+        }
+
+        auto& props = k->slider.getProperties();
+        const bool hadMod = props.contains ("modFrom");
+        if (lo == 0.0f && hi == 0.0f)
+        {
+            if (hadMod)
+            {
+                props.remove ("modFrom"); props.remove ("modTo"); props.remove ("modLive");
+                k->slider.repaint();
+            }
+            continue;
+        }
+
+        const float base = k->getParameter()->getValue();
+        const float from = juce::jlimit (0.0f, 1.0f, base + lo);
+        const float to   = juce::jlimit (0.0f, 1.0f, base + hi);
+        const bool live  = noteActive || table[t].global;
+        const float now  = live ? juce::jlimit (0.0f, 1.0f, base + processor.getLiveOffset (t)) : base;
+
+        const bool changed = ! hadMod || (float) props["modFrom"] != from || (float) props["modTo"] != to
+                          || (float) props["modLive"] != now;
+        if (changed)
+        {
+            props.set ("modFrom", from);
+            props.set ("modTo", to);
+            props.set ("modLive", now);
+            k->slider.repaint();
+        }
+    }
 }
 
 void RefractAudioProcessorEditor::paint (juce::Graphics& g)
@@ -456,8 +845,16 @@ void RefractAudioProcessorEditor::resized()
     for (auto& panel : panels)
         panel->setBounds (layerArea);
 
-    area.removeFromTop (8);
+    area.removeFromTop (6);
+    auto pageRow = area.removeFromTop (24);
+    for (auto& tab : pageTabs)
+        tab.setBounds (pageRow.removeFromLeft (110).reduced (2, 0));
+    area.removeFromTop (4);
     area.removeFromBottom (10);
+
+    mainPage.setBounds (area);
+    modPage.setBounds (area);
+    matrixPage.setBounds (area);
 
     // Lay out a row of sections, giving each width in proportion to its weight.
     auto layoutRow = [] (juce::Rectangle<int> row, std::initializer_list<std::pair<juce::Component*, int>> sections)
@@ -469,12 +866,18 @@ void RefractAudioProcessorEditor::resized()
         for (auto& s : sections)
         {
             auto r = --remaining == 0 ? row : row.removeFromLeft (unit * s.second);
-            s.first->setBounds (r.reduced (4));
+            s.first->setBounds (r.reduced (3));
         }
     };
 
-    const int rowH = (area.getHeight() - 4) / 2;
-    layoutRow (area.removeFromTop (rowH), { { &sub, 3 }, { &ampEnv, 4 }, { &modEnv, 4 }, { &filter, 3 } });
-    area.removeFromTop (4);
-    layoutRow (area, { { &lfo1, 2 }, { &lfo2, 2 }, { &matrix, 5 }, { &delay, 3 }, { &reverb, 3 }, { &output, 1 } });
+    // Main page: two rows
+    auto page = mainPage.getLocalBounds();
+    const int rowH = page.getHeight() / 2;
+    layoutRow (page.removeFromTop (rowH), { { &sub, 3 }, { &ampEnv, 4 }, { &filter, 3 }, { &voice, 3 } });
+    layoutRow (page, { { &delay, 3 }, { &reverb, 3 }, { &macros, 4 }, { &output, 1 } });
+
+    // Modulation page: LFOs on the left, envelopes on the right
+    auto mod = modPage.getLocalBounds();
+    lfoSection.setBounds (mod.removeFromLeft (mod.getWidth() * 62 / 100).reduced (3));
+    envSection.setBounds (mod.removeFromTop (mod.getHeight() * 55 / 100).reduced (3));
 }

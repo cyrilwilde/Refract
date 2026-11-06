@@ -124,13 +124,39 @@ To work on the code in Xcode instead of Terminal, open `build/Refract.xcodeproj`
    - **Size** sets the brush radius. **Strength** sets how far it cuts: 1.0 removes fully, 0.3 gently turns things down.
    - **Reset Paint** undoes all painting on the layer. **Invert** swaps kept and removed, which turns "remove this noise" into "keep *only* this noise".
    - When you let go of the mouse, "Rendering..." appears for a moment while the sample is rebuilt. The waveform view updates to show the edited sound.
-6. Shape the sound with the sub oscillator, envelopes, filter, LFOs, mod matrix and effects.
+6. Shape the sound on the **MAIN** page: sub oscillator, amp envelope, filter, voice pitch/pan/level, delay, reverb, macros and output.
 
-**Mod matrix tips.** Slots 1-3 come pre-routed with their amount set to 0, so you only need to turn an amount up:
+### Modulation (Stage 2)
 
-- *Mod Env → Cutoff* at +0.5, with the filter cutoff around 500 Hz, gives a classic filter sweep on each note.
-- *LFO 1 → Pitch* at about +0.02 gives vibrato. Pitch range is ±12 semitones at full amount, so small values go a long way.
-- *Mod Wheel → Cutoff* puts the filter on your controller's wheel.
+Almost every dial can be modulated. The exceptions are on/off switches and drop-down menus, plus the macros and the mod amounts themselves.
+
+- **The quick way:** right-click a dial, choose **Modulate with ▸**, and pick a source. It takes the first free row of the matrix with a gentle amount (0.25). Right-click again to remove it.
+- **The matrix** (**MATRIX** page): 16 rows of *source → destination × amount*. Destinations are grouped by section in the menu.
+  - An amount of ±1 means the full travel of the destination dial. Small amounts go a long way on wide ranges like Pitch, so shift-drag for fine control.
+  - Rows 1-3 come pre-routed at amount 0: Env 2 → Cutoff, LFO 1 → Pitch, Mod Wheel → Cutoff.
+- **Rings on the dials** (#CF9F9F) show modulation:
+  - the faint ring is the range the modulation can reach;
+  - the solid arc and dot show where it is right now, following the newest note you play.
+- **Sources:**
+  - the amp envelope and Envs 2-4;
+  - LFOs 1-4;
+  - Velocity, Mod Wheel, Aftertouch, Pitch Bend, Key Track (low notes negative, high notes positive) and Note Random (a different random value for each note);
+  - Macros 1-4. Map these in Live to drive several things from one knob.
+- **LFOs** (**MODULATION** page, tabs 1-4):
+  - **Shape:** Sine, Triangle, Saw Up, Saw Down, Square or **Random** (a new random level each cycle).
+  - **Rate Mode:**
+    - **Hz** is free speed.
+    - **Sync** locks to Live's tempo, from 1/32 to 8 bars, including dotted (D) and triplet (T) lengths. While Live is playing it also locks to the beat.
+    - **Freq** follows the note you play (Ratio 1 = the note's own pitch).
+  - **Depth** scales the LFO's output. It's modulatable too, e.g. Mod Wheel → LFO 1 Depth fades vibrato in.
+  - **Jitter** randomly stretches or squeezes each cycle by up to an octave. On Random it makes the steps land unevenly.
+  - **Smooth** rounds off sharp edges. On Random it turns steps into slow drifting curves.
+  - **Phase** sets where each cycle starts.
+  - **Retrigger** on: each note restarts the LFO at its Phase. Off: every note follows one shared, free-running LFO.
+  - The little scope shows the shape, and the pale line shows the LFO's live value.
+- **Envelopes 2-4** (**MODULATION** page): ADSR envelopes to use as sources. Their own times can be modulated too.
+
+Note: in Freq mode the LFO is still updated 1,500 times a second (once every 32 samples). At audio-rate speeds it gives a gritty, stepped result rather than clean FM. Proper FM comes with the oscillators in Stage 3.
 
 ---
 
@@ -288,6 +314,23 @@ JUCE's `Synthesiser` class handles MIDI: it finds a free voice for each note-on 
   - It takes a chunk of the sample and compares it with copies of itself delayed by 1, 2, 3... samples. When the delay equals one cycle of the waveform, the copy lines up and the difference dips.
   - The first clear dip gives the period, and `frequency = sampleRate / period`.
   - Converting to a note: `69 + 12 × log2(frequency / 440)`. The whole-number part becomes Root, and the leftover becomes Fine.
+
+### 3.11 Stage 2: how the modulation system works
+
+- **One list of targets** (`ParamTable` in `Parameters.cpp`). When the plugin starts, it walks through every parameter and keeps the continuous ones (float or whole-number). Each entry stores the parameter's ID, its display name, its group (for the menu) and its range. Adding a dial in a later stage automatically makes it modulatable, with no extra code.
+- **Modulation happens on the knob position, not the value.** Each voice keeps an `offsets` array, one number per target. The matrix adds `source × amount` into it, and `ParamTable::value()` returns `range.convertFrom0to1(knobPosition + offset)`. Because this uses the dial's own curve, +0.1 on Cutoff moves it the same distance as turning the dial a tenth of its travel. Modulating frequencies and times then sounds even, rather than everything happening at one end.
+- **Per voice vs global.** Every note has its own envelopes, LFOs, velocity and so on, so most targets are modulated separately per voice (`RefractVoice::computeModulation`). The delay, reverb and master volume process the whole mix, so they can't follow each note. They follow the **newest note** (the "lead voice"), and when nothing is playing they follow the free-running LFOs, wheel, aftertouch and macros (`computeGlobalModulation`).
+- **Order inside each 32-sample block:**
+  1. Read the sources (envelope values, LFOs, MIDI controls).
+  2. Run the matrix to fill the offsets.
+  3. Turn the modulated values into settings (`updateControl`).
+  - LFO settings read the *previous* block's offsets. That's how LFOs can modulate each other without an endless loop. The 0.7 ms delay is inaudible.
+- **The routing** (which source and which target per row) isn't a host parameter. It lives in a small table of atomics (`ModRouting`) that the UI writes and the audio thread reads. It's saved *by name* (`"lfo1"` → `"flt_cutoff"`), not by number, so future stages can add sources and dials without scrambling old sets. The amounts *are* parameters (`modN_amt`), so you can automate them in Live.
+- **The rings.** At the end of each block the processor copies the lead voice's offsets into atomics (`liveOffsets`). The editor's 30 Hz timer reads them for every dial and stores the range and live position as properties on the slider (`modFrom`, `modTo`, `modLive`). `RefractLookAndFeel::drawRotarySlider` then draws them.
+- **LFO internals** (`Lfo` in `SynthVoice.h`):
+  - A phase runs from 0 to 1. When it wraps, a new random level is picked (for Random) and a new jitter factor is chosen: `2^(jitter × random(-1..1))`, i.e. up to an octave faster or slower for that one cycle.
+  - Smooth is a one-pole low-pass on the output, a filter that moves a fraction of the way towards its target each step. Its time constant is `smooth² × ½ cycle`. Squaring makes the low end of the dial gentle.
+  - In Sync mode with Live playing, the phase is taken straight from the song position (`ppq ÷ beats per cycle`), so it can never drift off the beat.
 
 ---
 

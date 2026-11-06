@@ -73,6 +73,20 @@ public:
     // or returns -1 if no clear pitch was found.
     float detectPitch (int layer) const;
 
+    // --- Modulation (message thread) ------------------------------------------
+    const refract::ParamTable& getParamTable() const { return table; }
+    int  getModSource (int slot) const { return routing.source[(size_t) slot].load(); }
+    int  getModTarget (int slot) const { return routing.target[(size_t) slot].load(); }
+    void setModRouting (int slot, int source, int target);
+    int  addModulation (int source, int target);    // uses the first free slot; returns it, or -1 if full
+    void clearModSlot (int slot);
+
+    // What the dial rings show: the live modulation offset of a target (in knob
+    // travel) from the most recent note, and whether any note is sounding.
+    float getLiveOffset (int target) const { return liveOffsets[(size_t) target].load (std::memory_order_relaxed); }
+    bool  isNoteActive() const             { return noteActive.load (std::memory_order_relaxed); }
+    float getLiveSource (int source) const { return liveSources[(size_t) source].load (std::memory_order_relaxed); }
+
     juce::AudioProcessorValueTreeState apvts;
     juce::AudioFormatManager formatManager;
 
@@ -101,11 +115,25 @@ private:
     refract::SampleDataPtr readAudioFile (const juce::File& file);
     void timerCallback() override;   // frees replaced samples, off the audio thread
     void processDelay (juce::AudioBuffer<float>& buffer);
+    void updateHostInfo();
+    void computeGlobalModulation (int numSamples);
+    float gv (int index) const { return table.value (index, globalOffsets[(size_t) index]); }   // global value incl. modulation
+    static const refract::ParamTable& buildTable (refract::ParamTable&, juce::AudioProcessorValueTreeState&, juce::AudioProcessor&);
 
+    refract::ParamTable table;
     refract::ParamRefs params;
+    refract::ModRouting routing;
     refract::PlaybackBank bank;
     refract::PlayheadArray playheads;
+    refract::VoiceShared shared;
     refract::RefractSynth synth;
+
+    // Global modulation (effects, and the rings when no note is playing)
+    std::array<refract::Lfo, refract::numLfos> globalLfos;
+    std::vector<float> globalOffsets;
+    std::vector<std::atomic<float>> liveOffsets;
+    std::atomic<bool> noteActive { false };
+    std::array<std::atomic<float>, refract::numModSources> liveSources;
     std::array<LayerSlot, refract::numLayers> layers;
 
     juce::CriticalSection dataLock, publishLock;

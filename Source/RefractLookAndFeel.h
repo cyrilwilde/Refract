@@ -92,18 +92,32 @@ namespace refract::ui
             g.setColour (colours::value);
             g.strokePath (arc (bipolar ? angleAt (0.5f) : startAngle, valueAngle, arcR), stroke);
 
-            // Modulation arc (used from Stage 2): a thinner ring just inside, showing
-            // the range modulation is currently moving this parameter through.
+            // Modulation: a thinner ring just inside the value arc.
+            //  - faint: the whole range the routed modulation can reach
+            //  - solid: where modulation has the parameter right now
             const auto& props = slider.getProperties();
             if (props.contains ("modFrom") && props.contains ("modTo"))
             {
                 const float from = props["modFrom"], to = props["modTo"];
+                const float modR = arcR - lineW * 1.1f;
+                const auto modStroke = juce::PathStrokeType (lineW * 0.55f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded);
                 if (std::abs (to - from) > 0.001f)
                 {
-                    const float modR = arcR - lineW * 1.1f;
+                    g.setColour (colours::modulation.withAlpha (0.35f));
+                    g.strokePath (arc (angleAt (from), angleAt (to), modR), modStroke);
+                }
+                if (props.contains ("modLive"))
+                {
+                    const float live = props["modLive"];
+                    if (std::abs (live - pos) > 0.002f)
+                    {
+                        g.setColour (colours::modulation);
+                        g.strokePath (arc (valueAngle, angleAt (live), modR), modStroke);
+                    }
+                    const float a = angleAt (live);
                     g.setColour (colours::modulation);
-                    g.strokePath (arc (angleAt (from), angleAt (to), modR),
-                                  juce::PathStrokeType (lineW * 0.55f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+                    g.fillEllipse (juce::Rectangle<float> (lineW * 0.8f, lineW * 0.8f)
+                                       .withCentre ({ centre.x + modR * std::sin (a), centre.y - modR * std::cos (a) }));
                 }
             }
 

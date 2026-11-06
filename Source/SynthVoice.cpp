@@ -15,17 +15,17 @@ namespace refract
         float semitonesToRatio (float semis) { return std::pow (2.0f, semis / 12.0f); }
     }
 
-    RefractVoice::RefractVoice (int voiceIndex, const ParamRefs& p, const PlaybackBank& b,
-                                const float& wheel, PlayheadArray& heads)
-        : index (voiceIndex), params (p), bank (b), modWheel (wheel), playheads (heads) {}
+    RefractVoice::RefractVoice (int voiceIndex, VoiceShared& s)
+        : index (voiceIndex), shared (s)
+    {
+        offsets.assign ((size_t) shared.table->size(), 0.0f);   // allocated once, never on the audio thread
+    }
 
     void RefractVoice::prepare (double sr, int maxBlockSize)
     {
         sampleRate = sr;
-        ampEnv.setSampleRate (sr);
-        modEnv.setSampleRate (sr);
-        lfo1.setSampleRate (sr);
-        lfo2.setSampleRate (sr);
+        for (auto& e : envs) e.setSampleRate (sr);
+        for (auto& l : lfos) l.setSampleRate (sr);
 
         filter.prepare ({ sr, (juce::uint32) maxBlockSize, 2 });
         filterType = -1;
@@ -39,11 +39,11 @@ namespace refract
     {
         const double len = (double) ls.data->audio.getNumSamples();
 
-        double s = lp.start->load() * len, e = lp.end->load() * len;
+        double s = v (lp.start) * len, e = v (lp.end) * len;
         if (e < s) std::swap (s, e);
         if (e - s < 64.0) e = juce::jmin (len, s + 64.0);
 
-        double a = lp.loopStart->load() * len, b = lp.loopEnd->load() * len;
+        double a = v (lp.loopStart) * len, b = v (lp.loopEnd) * len;
         if (b < a) std::swap (a, b);
         a = juce::jlimit (s, e, a);
         b = juce::jlimit (s, e, b);
@@ -61,7 +61,7 @@ namespace refract
         ls.regionEnd = juce::jmin (e, len - 1.0);
         ls.loopStart = a;
         ls.loopEnd   = juce::jmin (b, len - 1.0);
-        ls.crossfade = juce::jlimit (0.0, a, (double) lp.crossfade->load() * (ls.loopEnd - ls.loopStart));
+        ls.crossfade = juce::jlimit (0.0, a, (double) v (lp.crossfade) * (ls.loopEnd - ls.loopStart));
         ls.loopMode  = (int) lp.loopMode->load();
 
         if (setStart)
@@ -73,31 +73,47 @@ namespace refract
 
     void RefractVoice::startNote (int midiNote, float vel, juce::SynthesiserSound*, int pitchWheel)
     {
+        const auto& P = *shared.params;
+        const auto& T = *shared.table;
+
         note = midiNote;
         velocity = vel;
         keyReleased = false;
+        noteRandom = random.nextFloat() * 2.0f - 1.0f;
+        noteId = ++shared.noteCounter;
+        shared.latestNote = noteId;
         pitchWheelMoved (pitchWheel);
+
+        std::fill (offsets.begin(), offsets.end(), 0.0f);   // forget the previous note's modulation
+        envValues.fill (0.0f);
+
+        // LFOs: Retrigger starts each note at the Phase knob; otherwise the LFO
+        // joins the free-running global LFO, so all notes move together.
+        for (int k = 0; k < numLfos; ++k)
+        {
+            const auto& L = P.lfos[(size_t) k];
+            const float phaseKnob = T.value (L.phase, 0.0f);
+            const bool retrig = L.retrig->load() > 0.5f;
+            lfos[(size_t) k].start (retrig ? phaseKnob : (float) shared.globalLfoPhase[(size_t) k] + phaseKnob);
+        }
+
+        computeModulation (controlBlockSize);   // so the very first sample is already modulated
 
         for (int i = 0; i < numLayers; ++i)
         {
             auto& ls = layers[(size_t) i];
-            ls.data = bank.get (i);   // grab the current version of this layer's sample
+            ls.data = shared.bank->get (i);   // grab the current version of this layer's sample
             ls.active = ls.data != nullptr && ls.data->audio.getNumSamples() > 128;
             ls.gainL = ls.gainR = ls.stepL = ls.stepR = 0.0f;
             if (ls.active)
-                updateRegion (ls, params.layers[(size_t) i], true);
+                updateRegion (ls, P.layers[(size_t) i], true);
         }
 
         subPhase = 0.0;
         subGain = subStep = 0.0f;
-
-        lfo1.reset();
-        lfo2.reset();
         filter.reset();
-        modEnvValue = 0.0f;
 
-        ampEnv.reset();
-        modEnv.reset();
+        for (auto& e : envs) e.reset();
         updateControl (controlBlockSize);   // sets envelope params, gains, filter
         // Start ramps from the target so the very first sample isn't faded in twice
         for (auto& ls : layers)
@@ -107,22 +123,16 @@ namespace refract
         }
         subGain += subStep * controlBlockSize; subStep = 0.0f;
 
-        ampEnv.noteOn();
-        modEnv.noteOn();
+        for (auto& e : envs) e.noteOn();
     }
 
     void RefractVoice::stopNote (float, bool allowTailOff)
     {
         keyReleased = true;
         if (allowTailOff)
-        {
-            ampEnv.noteOff();   // let the release stage play out
-            modEnv.noteOff();
-        }
+            for (auto& e : envs) e.noteOff();   // let the release stages play out
         else
-        {
-            finishNote();       // voice was stolen - stop immediately
-        }
+            finishNote();                        // voice was stolen - stop immediately
     }
 
     void RefractVoice::pitchWheelMoved (int newValue)
@@ -133,8 +143,7 @@ namespace refract
     void RefractVoice::finishNote()
     {
         clearCurrentNote();
-        ampEnv.reset();
-        modEnv.reset();
+        for (auto& e : envs) e.reset();
         for (auto& ls : layers)
         {
             ls.active = false;
@@ -148,69 +157,106 @@ namespace refract
         for (int i = 0; i < numLayers; ++i)
         {
             const auto& ls = layers[(size_t) i];
-            float v = -1.0f;
+            float pos = -1.0f;
             if (ls.active && ls.data != nullptr)
             {
-                v = (float) (ls.position / (double) ls.data->audio.getNumSamples());
-                if (ls.reversed) v = 1.0f - v;   // show it on the forwards waveform
+                pos = (float) (ls.position / (double) ls.data->audio.getNumSamples());
+                if (ls.reversed) pos = 1.0f - pos;   // show it on the forwards waveform
             }
-            playheads[(size_t) i][(size_t) index].store (v, std::memory_order_relaxed);
+            (*shared.playheads)[(size_t) i][(size_t) index].store (pos, std::memory_order_relaxed);
         }
     }
 
-    void RefractVoice::updateControl (int n)
+    // Step 1 of every control block: work out every modulation source, then run
+    // the mod matrix to get an offset for every modulatable parameter.
+    void RefractVoice::computeModulation (int n)
     {
-        // --- Envelope settings (cheap; lets you tweak them while notes play) ---
-        ampEnv.setParameters ({ params.ampEnv.attack->load(), params.ampEnv.decay->load(),
-                                params.ampEnv.sustain->load(), params.ampEnv.release->load() });
-        modEnv.setParameters ({ params.modEnv.attack->load(), params.modEnv.decay->load(),
-                                params.modEnv.sustain->load(), params.modEnv.release->load() });
+        const auto& P = *shared.params;
+        const auto& T = *shared.table;
+        const auto& R = *shared.routing;
 
-        // --- Modulation sources, all roughly in the range -1..1 ---
-        float src[numModSources] = {};
-        src[srcModEnv]   = modEnvValue;
-        src[srcLfo1]     = lfo1.advance (n, params.lfos[0].rate->load(), (int) params.lfos[0].shape->load());
-        src[srcLfo2]     = lfo2.advance (n, params.lfos[1].rate->load(), (int) params.lfos[1].shape->load());
-        src[srcVelocity] = velocity;
-        src[srcModWheel] = modWheel;
-        src[srcKeyTrack] = (float) (note - 60) / 60.0f;
+        // --- Sources -------------------------------------------------------------
+        for (int e = 0; e < numEnvs; ++e)
+            sources[(size_t) (srcEnv1 + e)] = envValues[(size_t) e];
 
-        // --- Mod matrix: add up source * amount for each destination ---
-        float dst[numModDests] = {};
-        for (const auto& slot : params.mods)
+        const double noteHz = juce::MidiMessage::getMidiNoteInHertz (note);
+        for (int k = 0; k < numLfos; ++k)
         {
-            const int s = (int) slot.source->load();
-            const int d = (int) slot.dest->load();
-            if (s > srcNone && s < numModSources && d > dstNone && d < numModDests)
-                dst[d] += src[s] * slot.amount->load();
+            // LFO settings use last block's modulation, so LFOs can modulate each other
+            const auto& L = P.lfos[(size_t) k];
+            const int mode = (int) L.mode->load();
+            const double hz = mode == rateSync ? shared.syncHz ((int) L.sync->load())
+                            : mode == rateFreq ? noteHz * (double) v (L.ratio)
+                                               : (double) v (L.rate);
+            sources[(size_t) (srcLfo1 + k)] = lfos[(size_t) k].advance (n, hz, (int) L.shape->load(), v (L.jitter), v (L.smooth))
+                                            * v (L.depth);
         }
 
-        const float pitchMod = dst[dstPitch] * 12.0f;                      // up to +/- 1 octave
-        const float panMod   = dst[dstPan];
-        ampGain = juce::jlimit (0.0f, 2.0f, 1.0f + dst[dstAmp])
-                * juce::jmap (velocity, 0.25f, 1.0f);                       // softer notes are quieter
+        sources[srcNone]       = 0.0f;
+        sources[srcVelocity]   = velocity;
+        sources[srcModWheel]   = shared.modWheel;
+        sources[srcAftertouch] = juce::jmax (polyAftertouch, shared.aftertouch);
+        sources[srcPitchBend]  = pitchBend / 2.0f;
+        sources[srcKeyTrack]   = (float) (note - 60) / 60.0f;
+        sources[srcNoteRandom] = noteRandom;
+        for (int m = 0; m < numMacros; ++m)
+            sources[(size_t) (srcMacro1 + m)] = P.macros[(size_t) m]->load();
+
+        // --- Matrix: offset[target] += source * amount --------------------------
+        std::fill (offsets.begin(), offsets.end(), 0.0f);
+        const int numTargets = T.size();
+        for (int slot = 0; slot < numModSlots; ++slot)
+        {
+            const int s = R.source[(size_t) slot].load (std::memory_order_relaxed);
+            const int t = R.target[(size_t) slot].load (std::memory_order_relaxed);
+            if (s > srcNone && s < numModSources && t >= 0 && t < numTargets)
+                offsets[(size_t) t] += sources[(size_t) s] * P.modAmounts[(size_t) slot]->load();
+        }
+
+        // The newest note drives the global effects and the dial rings
+        if (noteId == shared.latestNote)
+        {
+            shared.leadActive = true;
+            shared.leadSources = sources;
+            std::copy (offsets.begin(), offsets.end(), shared.leadOffsets.begin());
+        }
+    }
+
+    // Step 2: turn the (modulated) knob values into settings for this voice.
+    void RefractVoice::updateControl (int n)
+    {
+        const auto& P = *shared.params;
+
+        for (int e = 0; e < numEnvs; ++e)
+        {
+            const auto& E = P.envs[(size_t) e];
+            envs[(size_t) e].setParameters ({ v (E.attack), v (E.decay), v (E.sustain), v (E.release) });
+        }
+
+        const float pitchMod = v (P.pitch) + pitchBend;
+        const float voicePan = v (P.pan);
+        ampGain = v (P.voiceLevel) * juce::jmap (velocity, 0.25f, 1.0f);   // softer notes are quieter
 
         // --- Sample layers ---
         for (int i = 0; i < numLayers; ++i)
         {
             auto& ls = layers[(size_t) i];
-            const auto& lp = params.layers[(size_t) i];
+            const auto& lp = P.layers[(size_t) i];
 
             float targetL = 0.0f, targetR = 0.0f;
             if (ls.active)
             {
                 updateRegion (ls, lp, false);   // loop points can move while the note plays
 
-                const float level = lp.on->load() > 0.5f
-                                  ? juce::jlimit (0.0f, 1.0f, lp.level->load() + dst[dstLayer1 + i]) : 0.0f;
-                panGains (lp.pan->load() + panMod, targetL, targetR);
+                const float level = lp.on->load() > 0.5f ? v (lp.level) : 0.0f;
+                panGains (v (lp.pan) + voicePan, targetL, targetR);
                 targetL *= level;
                 targetR *= level;
 
                 // The root note plays the sample at its original pitch; every
                 // semitone away from it speeds up or slows down playback.
-                const float semis = (float) (note - (int) lp.root->load()) + lp.coarse->load()
-                                  + lp.fine->load() * 0.01f + pitchBend + pitchMod;
+                const float semis = (float) note - std::round (v (lp.root)) + std::round (v (lp.coarse))
+                                  + v (lp.fine) * 0.01f + pitchMod;
                 ls.increment = ls.data->sampleRate / sampleRate * (double) semitonesToRatio (semis);
             }
             ls.stepL = (targetL - ls.gainL) / (float) n;
@@ -219,18 +265,18 @@ namespace refract
 
         // --- Sub oscillator ---
         {
-            const float level  = juce::jlimit (0.0f, 1.0f, params.subLevel->load() + dst[dstSub]);
-            const int   octave = (int) params.subOctave->load() - 2;          // choices: -2, -1, 0
+            const float level  = v (P.subLevel);
+            const int   octave = (int) P.subOctave->load() - 2;          // choices: -2, -1, 0
             const double freq  = juce::MidiMessage::getMidiNoteInHertz (note) * std::pow (2.0, octave)
-                               * (double) semitonesToRatio (pitchBend + pitchMod);
+                               * (double) semitonesToRatio (pitchMod);
             subIncrement = freq / sampleRate;
-            subWave = (int) params.subWave->load();
-            panGains (panMod, subPanL, subPanR);
+            subWave = (int) P.subWave->load();
+            panGains (voicePan, subPanL, subPanR);
             subStep = (level - subGain) / (float) n;
         }
 
         // --- Filter ---
-        const int type = (int) params.filterType->load();
+        const int type = (int) P.filterType->load();
         if (type != filterType)
         {
             filterType = type;
@@ -238,11 +284,8 @@ namespace refract
                           : type == 1 ? juce::dsp::StateVariableTPTFilterType::bandpass
                                       : juce::dsp::StateVariableTPTFilterType::highpass);
         }
-        const float cutoff = params.cutoff->load() * std::pow (2.0f, dst[dstCutoff] * 6.0f);   // +/- 6 octaves
-        filter.setCutoffFrequency (juce::jlimit (20.0f, (float) sampleRate * 0.45f, cutoff));
-
-        const float res = juce::jlimit (0.0f, 1.0f, params.resonance->load() + dst[dstResonance]);
-        filter.setResonance (0.5f * std::pow (30.0f, res));   // Q from 0.5 (soft) to 15 (screaming)
+        filter.setCutoffFrequency (juce::jlimit (20.0f, (float) sampleRate * 0.45f, v (P.cutoff)));
+        filter.setResonance (0.5f * std::pow (30.0f, v (P.resonance)));   // Q from 0.5 (soft) to 15 (screaming)
     }
 
     // 4-point cubic (Hermite) interpolation: reading "between" samples smoothly is
@@ -274,6 +317,7 @@ namespace refract
         while (numSamples > 0)
         {
             const int n = juce::jmin (numSamples, controlBlockSize);
+            computeModulation (n);
             updateControl (n);
 
             for (int i = 0; i < n; ++i)
@@ -345,12 +389,12 @@ namespace refract
                 if (subGain > 0.0001f)
                 {
                     const float ph = (float) subPhase;
-                    float v;
-                    if (subWave == 0)      v = std::sin (juce::MathConstants<float>::twoPi * ph);
-                    else if (subWave == 1) v = 1.0f - 4.0f * std::abs (ph - 0.5f);
-                    else                   v = (ph < 0.5f ? 0.6f : -0.6f);   // square, a bit quieter
-                    left  += v * subGain * subPanL;
-                    right += v * subGain * subPanR;
+                    float s;
+                    if (subWave == 0)      s = std::sin (juce::MathConstants<float>::twoPi * ph);
+                    else if (subWave == 1) s = 1.0f - 4.0f * std::abs (ph - 0.5f);
+                    else                   s = (ph < 0.5f ? 0.6f : -0.6f);   // square, a bit quieter
+                    left  += s * subGain * subPanL;
+                    right += s * subGain * subPanR;
                 }
                 subPhase += subIncrement;
                 if (subPhase >= 1.0) subPhase -= 1.0;
@@ -359,8 +403,9 @@ namespace refract
                 left  = filter.processSample (0, left);
                 right = filter.processSample (1, right);
 
-                modEnvValue = modEnv.getNextSample();
-                const float g = ampEnv.getNextSample() * ampGain * 0.5f;   // 0.5 = headroom for chords
+                for (int e = 0; e < numEnvs; ++e)
+                    envValues[(size_t) e] = envs[(size_t) e].getNextSample();
+                const float g = envValues[0] * ampGain * 0.5f;   // 0.5 = headroom for chords
 
                 if (outChannels > 1)
                 {
@@ -374,7 +419,7 @@ namespace refract
             }
 
             const bool anyLayerPlaying = std::any_of (layers.begin(), layers.end(), [] (const LayerState& l) { return l.active; });
-            if (! ampEnv.isActive() || (! anyLayerPlaying && subGain <= 0.0001f && subStep <= 0.0f))
+            if (! envs[0].isActive() || (! anyLayerPlaying && subGain <= 0.0001f && subStep <= 0.0f))
             {
                 finishNote();
                 return;

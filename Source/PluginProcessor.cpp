@@ -43,20 +43,46 @@ namespace
 }
 
 //==============================================================================
+const ParamTable& RefractAudioProcessor::buildTable (ParamTable& t, juce::AudioProcessorValueTreeState& s, juce::AudioProcessor& p)
+{
+    t.build (s, p);   // must happen before ParamRefs looks things up in it
+    return t;
+}
+
 RefractAudioProcessor::RefractAudioProcessor()
     : AudioProcessor (BusesProperties().withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "PARAMS", createParameterLayout()),
-      params (apvts)
+      params (apvts, buildTable (table, apvts, *this)),
+      liveOffsets ((size_t) table.size())
 {
     formatManager.registerBasicFormats();   // WAV, AIFF, FLAC, Ogg, MP3 (on macOS)
 
     for (auto& layerHeads : playheads)
         for (auto& h : layerHeads)
             h.store (-1.0f);
+    for (auto& o : liveOffsets)
+        o.store (0.0f);
+    for (auto& s : liveSources)
+        s.store (0.0f);
+    globalOffsets.assign ((size_t) table.size(), 0.0f);
+
+    // Everything the voices share
+    shared.table = &table;
+    shared.params = &params;
+    shared.routing = &routing;
+    shared.bank = &bank;
+    shared.playheads = &playheads;
+    shared.leadOffsets.assign ((size_t) table.size(), 0.0f);
+    synth.shared = &shared;
 
     synth.addSound (new RefractSound());
     for (int i = 0; i < numVoices; ++i)
-        synth.addVoice (new RefractVoice (i, params, bank, synth.modWheel, playheads));
+        synth.addVoice (new RefractVoice (i, shared));
+
+    // Starting routes, all at amount 0 - turn an amount up in the matrix to hear them
+    setModRouting (0, srcEnv2,     table.indexOf ("flt_cutoff"));
+    setModRouting (1, srcLfo1,     table.indexOf ("voice_pitch"));
+    setModRouting (2, srcModWheel, table.indexOf ("flt_cutoff"));
 
     startTimerHz (2);
 }
@@ -76,12 +102,18 @@ void RefractAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBloc
         if (auto* v = dynamic_cast<RefractVoice*> (synth.getVoice (i)))
             v->prepare (sampleRate, samplesPerBlock);
 
+    for (int k = 0; k < numLfos; ++k)
+    {
+        globalLfos[(size_t) k].setSampleRate (sampleRate);
+        globalLfos[(size_t) k].start (0.0f);
+    }
+
     const juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32) samplesPerBlock, 2 };
 
     delay.setMaximumDelayInSamples ((int) (sampleRate * 2.1));
     delay.prepare (spec);
     delaySamples.reset (sampleRate, 0.25);   // glide delay-time changes over 250 ms
-    delaySamples.setCurrentAndTargetValue (params.delayTime->load() * 0.001f * (float) sampleRate);
+    delaySamples.setCurrentAndTargetValue (table.value (params.delayTime, 0.0f) * 0.001f * (float) sampleRate);
 
     reverb.prepare (spec);
     reverb.reset();
@@ -96,23 +128,96 @@ bool RefractAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) 
     return out == juce::AudioChannelSet::stereo() || out == juce::AudioChannelSet::mono();
 }
 
+void RefractAudioProcessor::updateHostInfo()
+{
+    // Tempo and song position from Live, for synced LFOs
+    if (auto* ph = getPlayHead())
+        if (auto pos = ph->getPosition())
+        {
+            if (auto bpm = pos->getBpm()) shared.host.bpm = juce::jlimit (20.0, 999.0, *bpm);
+            if (auto ppq = pos->getPpqPosition()) shared.host.ppq = *ppq;
+            shared.host.playing = pos->getIsPlaying();
+        }
+}
+
+void RefractAudioProcessor::computeGlobalModulation (int numSamples)
+{
+    // Free-running LFOs: voices with Retrigger off lock onto these. In Sync mode
+    // with Live playing they follow the song position, so they stay on the beat.
+    std::array<float, numModSources> src {};
+    for (int k = 0; k < numLfos; ++k)
+    {
+        const auto& L = params.lfos[(size_t) k];
+        auto& lfo = globalLfos[(size_t) k];
+        const int mode = (int) L.mode->load();
+        const double hz = mode == rateSync ? shared.syncHz ((int) L.sync->load())
+                        : mode == rateFreq ? 261.63 * (double) table.value (L.ratio, 0.0f)   // as if playing C3
+                                           : (double) table.value (L.rate, 0.0f);
+        if (mode == rateSync && shared.host.playing)
+            lfo.setPhase (shared.host.ppq / syncBeats ((int) L.sync->load()));
+        src[(size_t) (srcLfo1 + k)] = lfo.advance (numSamples, hz, (int) L.shape->load(),
+                                                   table.value (L.jitter, 0.0f), table.value (L.smooth, 0.0f))
+                                    * table.value (L.depth, 0.0f);
+        shared.globalLfoPhase[(size_t) k] = lfo.getPhase();
+    }
+
+    // While a note plays, the effects follow that note's modulation; otherwise
+    // only the "global" sources (LFOs, wheel, aftertouch, macros) apply.
+    if (shared.leadActive)
+    {
+        src = shared.leadSources;
+    }
+    else
+    {
+        src[srcModWheel]   = shared.modWheel;
+        src[srcAftertouch] = shared.aftertouch;
+        for (int m = 0; m < numMacros; ++m)
+            src[(size_t) (srcMacro1 + m)] = params.macros[(size_t) m]->load();
+    }
+
+    std::fill (globalOffsets.begin(), globalOffsets.end(), 0.0f);
+    for (int slot = 0; slot < numModSlots; ++slot)
+    {
+        const int s = routing.source[(size_t) slot].load (std::memory_order_relaxed);
+        const int t = routing.target[(size_t) slot].load (std::memory_order_relaxed);
+        if (s > srcNone && s < numModSources && t >= 0 && t < table.size() && table[t].global)
+            globalOffsets[(size_t) t] += src[(size_t) s] * params.modAmounts[(size_t) slot]->load();
+    }
+
+    // Publish for the dial rings
+    for (int t = 0; t < table.size(); ++t)
+    {
+        const float live = table[t].global ? globalOffsets[(size_t) t]
+                         : shared.leadActive ? shared.leadOffsets[(size_t) t] : 0.0f;
+        liveOffsets[(size_t) t].store (live, std::memory_order_relaxed);
+    }
+    noteActive.store (shared.leadActive, std::memory_order_relaxed);
+    for (int s = 0; s < numModSources; ++s)
+        liveSources[(size_t) s].store (src[(size_t) s], std::memory_order_relaxed);
+}
+
 void RefractAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
 {
     juce::ScopedNoDenormals noDenormals;   // stops tiny numbers slowing the CPU to a crawl
     buffer.clear();
+    updateHostInfo();
 
-    // 1. Voices: MIDI in, audio out
+    // 1. Voices: MIDI in, audio out (each voice also reports if it's the newest note)
+    shared.leadActive = false;
     synth.renderNextBlock (buffer, midi, 0, buffer.getNumSamples());
 
-    // 2. Delay
+    // 2. Modulation for the effects
+    computeGlobalModulation (buffer.getNumSamples());
+
+    // 3. Delay
     processDelay (buffer);
 
-    // 3. Reverb
+    // 4. Reverb
     juce::dsp::Reverb::Parameters rp;
-    rp.roomSize = params.reverbSize->load();
-    rp.damping  = params.reverbDamping->load();
-    rp.wetLevel = params.reverbMix->load();
-    rp.dryLevel = 1.0f - params.reverbMix->load() * 0.5f;
+    rp.roomSize = gv (params.reverbSize);
+    rp.damping  = gv (params.reverbDamping);
+    rp.wetLevel = gv (params.reverbMix);
+    rp.dryLevel = 1.0f - rp.wetLevel * 0.5f;
     rp.width    = 1.0f;
     reverb.setParameters (rp);
 
@@ -120,17 +225,17 @@ void RefractAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce
     juce::dsp::ProcessContextReplacing<float> context (block);
     reverb.process (context);
 
-    // 4. Master volume
-    master.setGainDecibels (params.masterGain->load());
+    // 5. Master volume
+    master.setGainDecibels (gv (params.master));
     master.process (context);
 }
 
 void RefractAudioProcessor::processDelay (juce::AudioBuffer<float>& buffer)
 {
-    const float feedback = params.delayFeedback->load();
-    const float mix      = params.delayMix->load();
+    const float feedback = gv (params.delayFeedback);
+    const float mix      = gv (params.delayMix);
     delaySamples.setTargetValue (juce::jlimit (1.0f, (float) currentSampleRate * 2.0f,
-                                               params.delayTime->load() * 0.001f * (float) currentSampleRate));
+                                               gv (params.delayTime) * 0.001f * (float) currentSampleRate));
 
     const int channels = juce::jmin (buffer.getNumChannels(), 2);
     for (int i = 0; i < buffer.getNumSamples(); ++i)
@@ -143,6 +248,51 @@ void RefractAudioProcessor::processDelay (juce::AudioBuffer<float>& buffer)
             delay.pushSample (ch, dry + wet * feedback);   // feed some of the echo back in
             buffer.setSample (ch, i, dry + wet * mix);
         }
+    }
+}
+
+//==============================================================================
+//  Mod matrix routing
+//==============================================================================
+void RefractAudioProcessor::setModRouting (int slot, int source, int target)
+{
+    if (slot < 0 || slot >= numModSlots) return;
+    routing.source[(size_t) slot].store (juce::jlimit (0, numModSources - 1, source));
+    routing.target[(size_t) slot].store (target >= 0 && target < table.size() ? target : -1);
+    sendChangeMessage();
+}
+
+int RefractAudioProcessor::addModulation (int source, int target)
+{
+    // Prefer a completely empty slot; otherwise one with no amount set
+    for (int pass = 0; pass < 2; ++pass)
+        for (int slot = 0; slot < numModSlots; ++slot)
+        {
+            const bool empty = getModSource (slot) == srcNone || getModTarget (slot) < 0;
+            const bool unused = pass == 1 && std::abs (params.modAmounts[(size_t) slot]->load()) < 0.0001f;
+            if (empty || unused)
+            {
+                setModRouting (slot, source, target);
+                if (auto* p = apvts.getParameter (ids::modAmount (slot)))
+                {
+                    p->beginChangeGesture();
+                    p->setValueNotifyingHost (p->convertTo0to1 (0.25f));   // a gentle starting amount
+                    p->endChangeGesture();
+                }
+                return slot;
+            }
+        }
+    return -1;
+}
+
+void RefractAudioProcessor::clearModSlot (int slot)
+{
+    setModRouting (slot, srcNone, -1);
+    if (auto* p = apvts.getParameter (ids::modAmount (slot)))
+    {
+        p->beginChangeGesture();
+        p->setValueNotifyingHost (p->convertTo0to1 (0.0f));
+        p->endChangeGesture();
     }
 }
 
@@ -430,6 +580,21 @@ void RefractAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     }
     root.appendChild (layerTree, nullptr);
 
+    // Mod routing is saved by name (source key + parameter ID), not by number,
+    // so it survives future versions that add sources or parameters.
+    juce::ValueTree modTree ("ModRouting");
+    const auto keys = modSourceKeys();
+    for (int s = 0; s < numModSlots; ++s)
+    {
+        juce::ValueTree slot ("Slot");
+        slot.setProperty ("index", s, nullptr);
+        slot.setProperty ("source", keys[getModSource (s)], nullptr);
+        const int t = getModTarget (s);
+        slot.setProperty ("target", t >= 0 ? table[t].id : juce::String(), nullptr);
+        modTree.appendChild (slot, nullptr);
+    }
+    root.appendChild (modTree, nullptr);
+
     if (auto xml = root.createXml())
         copyXmlToBinary (*xml, destData);
 }
@@ -447,6 +612,21 @@ void RefractAudioProcessor::setStateInformation (const void* data, int sizeInByt
     const auto paramTree = root.getChildWithName (apvts.state.getType());
     if (paramTree.isValid())
         apvts.replaceState (paramTree);
+
+    const auto modTree = root.getChildWithName ("ModRouting");
+    if (modTree.isValid())
+    {
+        const auto keys = modSourceKeys();
+        for (int s = 0; s < numModSlots; ++s)
+            setModRouting (s, srcNone, -1);
+        for (const auto slot : modTree)
+        {
+            const int s = slot.getProperty ("index", -1);
+            if (s >= 0 && s < numModSlots)
+                setModRouting (s, juce::jmax (0, keys.indexOf (slot.getProperty ("source").toString())),
+                               table.indexOf (slot.getProperty ("target").toString()));
+        }
+    }
 
     for (const auto l : root.getChildWithName ("Layers"))
     {
