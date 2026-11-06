@@ -2,13 +2,15 @@
 //
 // SynthVoice.h
 // One voice = one playing note. The synth owns 16 of these and hands each new
-// note to a free one. Each voice plays the 3 sample layers + sub oscillator,
-// runs its own 4 envelopes, 4 LFOs and filter, and applies the mod matrix.
+// note to a free one. Each voice plays the 3 sample layers, 2 oscillators,
+// sub and noise; runs its own 4 envelopes, 4 LFOs and filter; applies the
+// mod matrix; and handles unison and glide.
 //
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_dsp/juce_dsp.h>
 #include "Parameters.h"
 #include "SampleData.h"
+#include "Wavetable.h"
 
 namespace refract
 {
@@ -101,11 +103,12 @@ namespace refract
 
     struct VoiceShared
     {
-        const ParamTable*   table = nullptr;
-        const ParamRefs*    params = nullptr;
-        const ModRouting*   routing = nullptr;
-        const PlaybackBank* bank = nullptr;
-        PlayheadArray*      playheads = nullptr;
+        const ParamTable*    table = nullptr;
+        const ParamRefs*     params = nullptr;
+        const ModRouting*    routing = nullptr;
+        const PlaybackBank*  bank = nullptr;
+        const WavetableBank* wavetables = nullptr;
+        PlayheadArray*       playheads = nullptr;
 
         HostInfo host;
         float modWheel = 0.0f, aftertouch = 0.0f;
@@ -116,30 +119,13 @@ namespace refract
         std::array<float, numModSources> leadSources {};
         std::vector<float> leadOffsets;
 
+        // Glide bookkeeping
+        float lastNote = -1.0f;      // pitch of the previous note (-1 = none yet)
+        int   keysDown = 0;          // how many keys are held right now
+        bool  overlapping = false;   // the note being started overlaps a held one
+
         // Tempo in Hz for an LFO in Sync mode
         double syncHz (int syncIndex) const { return host.bpm / 60.0 / syncBeats (syncIndex); }
-    };
-
-    // Synthesiser that also remembers the mod wheel and channel aftertouch, so
-    // notes started *after* they moved still know where they are.
-    class RefractSynth : public juce::Synthesiser
-    {
-    public:
-        VoiceShared* shared = nullptr;
-
-        void handleController (int midiChannel, int controllerNumber, int controllerValue) override
-        {
-            if (controllerNumber == 1 && shared != nullptr)
-                shared->modWheel = (float) controllerValue / 127.0f;
-            juce::Synthesiser::handleController (midiChannel, controllerNumber, controllerValue);
-        }
-
-        void handleChannelPressure (int midiChannel, int value) override
-        {
-            if (shared != nullptr)
-                shared->aftertouch = (float) value / 127.0f;
-            juce::Synthesiser::handleChannelPressure (midiChannel, value);
-        }
     };
 
     //==========================================================================
@@ -149,6 +135,10 @@ namespace refract
         RefractVoice (int voiceIndex, VoiceShared& shared);
 
         void prepare (double sampleRate, int maxBlockSize);
+
+        // Mono/Legato: the next startNote changes the pitch of this voice instead
+        // of starting from scratch. retrigger = restart envelopes and samples.
+        void prepareLegato (bool retrigger) { legatoPending = true; legatoRetrigger = retrigger; }
 
         bool canPlaySound (juce::SynthesiserSound* s) override { return dynamic_cast<RefractSound*> (s) != nullptr; }
         void startNote (int midiNote, float velocity, juce::SynthesiserSound*, int pitchWheel) override;
@@ -166,21 +156,55 @@ namespace refract
         // ("control rate") rather than every sample - much cheaper, inaudible.
         static constexpr int controlBlockSize = 32;
 
+        // One copy of a sample being read (a layer has 1-4 for unison)
+        struct SampleReader
+        {
+            bool   active = false;
+            double position = 0.0;
+            int    direction = 1;        // +1 forwards, -1 backwards (ping-pong)
+            double ratio = 1.0;          // unison detune as a speed ratio
+            float  panL = 1.0f, panR = 1.0f;
+        };
+
         struct LayerState
         {
             SampleDataPtr data;           // keeps the sample alive while this note plays
-            bool   active = false;
             bool   reversed = false;      // reading the reversed copy of the sample
-            double position = 0.0;        // read position in samples (fractional)
-            double increment = 0.0;       // how far to move per output sample
-            int    direction = 1;         // +1 forwards, -1 backwards (ping-pong)
+            double increment = 0.0;       // speed for the un-detuned copy
+            double startPos = 0.0;
 
             // Region in the buffer being read (already mirrored when reversed)
             double regionEnd = 0.0, loopStart = 0.0, loopEnd = 0.0, crossfade = 0.0;
             int    loopMode = loopOff;
 
-            float  gainL = 0.0f, gainR = 0.0f;       // current (ramped) gains
-            float  stepL = 0.0f, stepR = 0.0f;       // per-sample ramp toward the target
+            int numCopies = 1;
+            std::array<SampleReader, maxLayerUnison> copies;
+            float gain = 0.0f, gainStep = 0.0f;   // level, ramped smoothly
+
+            bool anyActive() const
+            {
+                for (int c = 0; c < numCopies; ++c) if (copies[(size_t) c].active) return true;
+                return false;
+            }
+        };
+
+        // One oscillator with up to 8 unison voices
+        struct OscState
+        {
+            bool   on = false;
+            int    mode = oscAnalog;
+            int    numVoices = 1;
+            std::array<double, maxUnison> phase {};
+            std::array<double, maxUnison> increment {};
+            std::array<float,  maxUnison> panL {}, panR {};
+            std::array<float,  maxUnison> lastOut {};      // for FM (osc 1 -> osc 2)
+            std::array<bool,   maxUnison> wrapped {};      // for hard sync
+            std::array<double, maxUnison> wrapFraction {};
+            float wave = 2.0f, pulseWidth = 0.5f;
+            WavetablePtr table;
+            const float* frameA = nullptr; const float* frameB = nullptr;
+            float frameMix = 0.0f;
+            float gain = 0.0f, gainStep = 0.0f;
         };
 
         // A parameter's value for this voice, including its modulation
@@ -189,8 +213,11 @@ namespace refract
         void computeModulation (int numSamples);
         void updateControl (int numSamples);
         void updateRegion (LayerState& ls, const ParamRefs::Layer& lp, bool setStart);
+        void updateOscillator (int index, double baseHz, int numSamples);
+        void restartLayers();
         void finishNote();
         void publishPlayheads();
+        float renderOsc (OscState& o, float& left, float& right, const OscState* master, float fm, bool sync);
         static float readSample (const juce::AudioBuffer<float>& buffer, int channel, double position);
 
         const int index;
@@ -198,6 +225,7 @@ namespace refract
 
         double sampleRate = 44100.0;
         std::array<LayerState, numLayers> layers;
+        std::array<OscState, numOscs> oscs;
 
         // Modulation state
         std::vector<float> offsets;                    // per ParamTable entry, in knob travel
@@ -209,18 +237,59 @@ namespace refract
         float noteRandom = 0.0f;
         juce::uint32 noteId = 0;
 
+        // Sub and noise
         double subPhase = 0.0, subIncrement = 0.0;
         int    subWave = 0;
         float  subGain = 0.0f, subStep = 0.0f, subPanL = 1.0f, subPanR = 1.0f;
+        float  noiseGain = 0.0f, noiseStep = 0.0f, noiseLp = 0.0f, noiseLpCoef = 1.0f, noiseHpMix = 0.0f;
 
         juce::dsp::StateVariableTPTFilter<float> filter;
         int filterType = -1;
 
-        int   note = 60;
+        // Pitch and glide
+        int   note = 60;                  // the key that was pressed
+        float currentPitch = 60.0f;       // where the pitch is now (glides towards `note`)
+        float glideRate = 0.0f;           // semitones per sample; 0 = no glide
+        bool  legatoPending = false, legatoRetrigger = false;
+
         float velocity = 1.0f;
         float pitchBend = 0.0f;           // semitones
         float polyAftertouch = 0.0f;
         float ampGain = 1.0f;
         bool  keyReleased = false;        // note-off received (for "Fwd + Release" loops)
+    };
+
+    //==========================================================================
+    // The synth: hands notes to voices. Also handles Mono/Legato modes, and
+    // remembers the mod wheel and aftertouch so notes started later know them.
+    //==========================================================================
+    class RefractSynth : public juce::Synthesiser
+    {
+    public:
+        RefractSynth() { heldNotes.reserve (128); }
+        VoiceShared* shared = nullptr;
+
+        void handleController (int midiChannel, int controllerNumber, int controllerValue) override
+        {
+            if (controllerNumber == 1 && shared != nullptr)
+                shared->modWheel = (float) controllerValue / 127.0f;
+            juce::Synthesiser::handleController (midiChannel, controllerNumber, controllerValue);
+        }
+
+        void handleChannelPressure (int midiChannel, int value) override
+        {
+            if (shared != nullptr)
+                shared->aftertouch = (float) value / 127.0f;
+            juce::Synthesiser::handleChannelPressure (midiChannel, value);
+        }
+
+        void noteOn (int midiChannel, int midiNoteNumber, float velocity) override;
+        void noteOff (int midiChannel, int midiNoteNumber, float velocity, bool allowTailOff) override;
+        void allNotesOff (int midiChannel, bool allowTailOff) override;
+
+    private:
+        int voiceMode() const;
+        std::vector<int> heldNotes;   // in the order they were pressed (Mono/Legato)
+        float lastVelocity = 1.0f;
     };
 }

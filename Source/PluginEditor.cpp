@@ -392,6 +392,150 @@ void ModMatrixPage::resized()
 }
 
 //==============================================================================
+//  Oscillator page
+//==============================================================================
+void OscScope::paint (juce::Graphics& g)
+{
+    const auto r = getLocalBounds().toFloat().reduced (2.0f);
+    g.setColour (colours::background);
+    g.fillRoundedRectangle (r, 4.0f);
+    g.setColour (colours::panelEdge);
+    g.drawHorizontalLine ((int) r.getCentreY(), r.getX(), r.getRight());
+
+    auto& s = processor.apvts;
+    auto get = [&s, this] (const char* name) { return s.getRawParameterValue (ids::osc (osc, name))->load(); };
+    const bool on = get ("on") > 0.5f;
+    const int mode = (int) get ("mode");
+
+    // Work out one cycle of the waveform at 'points' positions
+    const int points = juce::jmax (2, (int) r.getWidth());
+    std::vector<float> values ((size_t) points, 0.0f);
+
+    if (mode == oscAnalog)
+    {
+        const float wave = get ("wave"), pw = get ("pw");
+        auto shape = [pw] (int k, float p)
+        {
+            switch (k)
+            {
+                case 0:  return std::sin (juce::MathConstants<float>::twoPi * p);
+                case 1:  return 1.0f - 4.0f * std::abs (p - 0.5f);
+                case 2:  return 2.0f * p - 1.0f;
+                default: return p < pw ? 1.0f : -1.0f;
+            }
+        };
+        const int a = juce::jmin ((int) wave, 2);
+        const float mix = wave - (float) a;
+        for (int i = 0; i < points; ++i)
+        {
+            const float p = (float) i / (float) (points - 1);
+            values[(size_t) i] = shape (a, p) + (shape (a + 1, p) - shape (a, p)) * mix;
+        }
+    }
+    else if (auto table = processor.getWavetable ((int) get ("table")))
+    {
+        const float pos = juce::jlimit (0.0f, 1.0f, get ("pos")) * (float) (wtFrames - 1);
+        const int f0 = juce::jmin ((int) pos, wtFrames - 1), f1 = juce::jmin (f0 + 1, wtFrames - 1);
+        const float mix = pos - (float) f0;
+        const float* fa = table->get (f0, 0);
+        const float* fb = table->get (f1, 0);
+        for (int i = 0; i < points; ++i)
+        {
+            const int idx = juce::jmin (wtSize - 1, i * wtSize / points);
+            values[(size_t) i] = fa[idx] + (fb[idx] - fa[idx]) * mix;
+        }
+    }
+    else
+    {
+        g.setColour (colours::dimText);
+        g.setFont (juce::Font (juce::FontOptions (11.0f)));
+        g.drawText ((int) get ("table") >= numBuiltInTables ? "Load a sample into that layer" : "Building...",
+                    getLocalBounds(), juce::Justification::centred);
+        return;
+    }
+
+    juce::Path path;
+    for (int i = 0; i < points; ++i)
+    {
+        const float x = r.getX() + (float) i;
+        const float y = r.getCentreY() - juce::jlimit (-1.0f, 1.0f, values[(size_t) i]) * r.getHeight() * 0.42f;
+        if (i == 0) path.startNewSubPath (x, y); else path.lineTo (x, y);
+    }
+    g.setColour (on ? colours::waveform : colours::track);
+    g.strokePath (path, juce::PathStrokeType (1.5f));
+}
+
+OscPanel::OscPanel (RefractAudioProcessor& p, int oscIndex)
+    : Section ("OSC " + juce::String (oscIndex + 1)), processor (p), osc (oscIndex),
+      on          (p.apvts, ids::osc (oscIndex, "on"),     "On"),
+      mode        (p.apvts, ids::osc (oscIndex, "mode"),   "Mode"),
+      wave        (p.apvts, ids::osc (oscIndex, "wave"),   "Wave"),
+      table       (p.apvts, ids::osc (oscIndex, "table"),  "Table"),
+      pulseWidth  (p.apvts, ids::osc (oscIndex, "pw"),     "Pulse W"),
+      position    (p.apvts, ids::osc (oscIndex, "pos"),    "Position"),
+      level       (p.apvts, ids::osc (oscIndex, "level"),  "Level"),
+      pan         (p.apvts, ids::osc (oscIndex, "pan"),    "Pan", true),
+      octave      (p.apvts, ids::osc (oscIndex, "oct"),    "Octave", true),
+      semi        (p.apvts, ids::osc (oscIndex, "semi"),   "Semi", true),
+      fine        (p.apvts, ids::osc (oscIndex, "fine"),   "Fine", true),
+      unison      (p.apvts, ids::osc (oscIndex, "unison"), "Unison"),
+      detune      (p.apvts, ids::osc (oscIndex, "detune"), "Detune"),
+      spread      (p.apvts, ids::osc (oscIndex, "spread"), "Spread"),
+      randomPhase (p.apvts, ids::osc (oscIndex, "rphase"), "Rnd Phase"),
+      scope (p, oscIndex)
+{
+    if (oscIndex == 1)
+    {
+        sync = std::make_unique<Toggle> (p.apvts, "osc2_sync", "Sync");
+        fm = std::make_unique<Knob> (p.apvts, "osc2_fm", "FM");
+        sync->button.setTooltip ("Hard sync: Osc 2 restarts every time Osc 1 starts a cycle. Sweep Osc 2's pitch for classic sync sounds.");
+        fm->slider.setTooltip ("Osc 1 modulates Osc 2's phase - metallic, bell and growl tones");
+        addAndMakeVisible (*sync);
+        addAndMakeVisible (*fm);
+    }
+    for (auto* c : std::initializer_list<juce::Component*> { &on, &mode, &wave, &table, &pulseWidth, &position, &level, &pan,
+                                                              &octave, &semi, &fine, &unison, &detune, &spread, &randomPhase, &scope })
+        addAndMakeVisible (c);
+    wave.slider.setTooltip ("Morphs sine > triangle > saw > square");
+    randomPhase.slider.setTooltip ("How randomly each note (and each unison voice) starts - makes unison wide instead of phasey");
+    timerCallback();
+    startTimerHz (10);
+}
+
+void OscPanel::timerCallback()
+{
+    const int m = (int) processor.apvts.getRawParameterValue (ids::osc (osc, "mode"))->load();
+    if (m == shownMode) return;
+    shownMode = m;
+    wave.setVisible (m == oscAnalog);
+    pulseWidth.setVisible (m == oscAnalog);
+    table.setVisible (m == oscWavetable);
+    position.setVisible (m == oscWavetable);
+}
+
+void OscPanel::resized()
+{
+    auto area = getContentArea();
+    auto top = area.removeFromTop (area.getHeight() / 2);
+    auto bottom = area;
+    const int w = top.getWidth() / 9;
+    auto place = [w] (juce::Rectangle<int>& row, juce::Component& c) { c.setBounds (row.removeFromLeft (w).reduced (2)); };
+
+    place (top, on); place (top, mode);
+    const auto slotA = top.removeFromLeft (w).reduced (2);
+    wave.setBounds (slotA); table.setBounds (slotA);
+    const auto slotB = top.removeFromLeft (w).reduced (2);
+    pulseWidth.setBounds (slotB); position.setBounds (slotB);
+    place (top, level); place (top, pan);
+    scope.setBounds (top.reduced (4, 8));
+
+    place (bottom, octave); place (bottom, semi); place (bottom, fine);
+    place (bottom, unison); place (bottom, detune); place (bottom, spread); place (bottom, randomPhase);
+    if (sync != nullptr) place (bottom, *sync);
+    if (fm != nullptr)   place (bottom, *fm);
+}
+
+//==============================================================================
 //  Layer panel
 //==============================================================================
 LayerPanel::LayerPanel (RefractAudioProcessor& p, int layerIndex)
@@ -408,7 +552,10 @@ LayerPanel::LayerPanel (RefractAudioProcessor& p, int layerIndex)
       loopStart (p.apvts, ids::layer (layerIndex, "loopstart"), "Loop Start"),
       loopEnd   (p.apvts, ids::layer (layerIndex, "loopend"),   "Loop End"),
       crossfade (p.apvts, ids::layer (layerIndex, "xfade"),     "X-Fade"),
-      reverse   (p.apvts, ids::layer (layerIndex, "reverse"),   "Reverse")
+      reverse   (p.apvts, ids::layer (layerIndex, "reverse"),   "Reverse"),
+      unison    (p.apvts, ids::layer (layerIndex, "unison"),    "Unison"),
+      detune    (p.apvts, ids::layer (layerIndex, "detune"),    "Detune"),
+      spread    (p.apvts, ids::layer (layerIndex, "spread"),    "Spread")
 {
     addAndMakeVisible (spectral);
 
@@ -417,7 +564,7 @@ LayerPanel::LayerPanel (RefractAudioProcessor& p, int layerIndex)
              &resetMaskButton, &invertMaskButton, &toolBox, &modeBox, &sizeSlider, &strengthSlider,
              &sizeLabel, &strengthLabel,
              &on, &level, &pan, &root, &transpose, &fine, &detectButton, &start, &end,
-             &loopMode, &loopStart, &loopEnd, &crossfade, &reverse })
+             &loopMode, &loopStart, &loopEnd, &crossfade, &reverse, &unison, &detune, &spread })
         addAndMakeVisible (c);
 
     fileLabel.setColour (juce::Label::textColourId, colours::text);
@@ -600,7 +747,7 @@ void LayerPanel::resized()
 
     // Layer controls along the bottom, in groups
     auto controls = area.removeFromBottom (74);
-    const int w = controls.getWidth() / 15;
+    const int w = controls.getWidth() / 18;
     auto place = [&] (juce::Component& c) { c.setBounds (controls.removeFromLeft (w).reduced (2, 0)); };
     auto gap = [&] { controls.removeFromLeft (w / 4); };
 
@@ -609,7 +756,8 @@ void LayerPanel::resized()
     detectButton.setBounds (controls.removeFromLeft (w).withSizeKeepingCentre (w - 6, 24)); gap();
     place (start); place (end); gap();
     place (loopMode); place (loopStart); place (loopEnd); place (crossfade);
-    place (reverse);
+    place (reverse); gap();
+    place (unison); place (detune); place (spread);
 
     area.removeFromBottom (6);
     spectral.setBounds (area);
@@ -620,6 +768,7 @@ void LayerPanel::resized()
 //==============================================================================
 RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor& p)
     : AudioProcessorEditor (&p), processor (p), matrixPage (p),
+      osc1 (p, 0), osc2 (p, 1),
       lfoSection ("LFO", { "1", "2", "3", "4" }, 3001),
       envSection ("ENVELOPE", { "2", "3", "4" }, 3002)
 {
@@ -641,8 +790,8 @@ RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor&
     }
 
     // Page tabs for the bottom half
-    const char* pageNames[] = { "MAIN", "MODULATION", "MATRIX" };
-    for (int i = 0; i < 3; ++i)
+    const char* pageNames[] = { "MAIN", "OSC", "MODULATION", "MATRIX" };
+    for (int i = 0; i < 4; ++i)
     {
         auto& tab = pageTabs[(size_t) i];
         tab.setButtonText (pageNames[i]);
@@ -653,10 +802,6 @@ RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor&
     }
 
     // --- Main page ---
-    sub.add<Knob>   (s, "sub_level", "Level");
-    sub.add<Choice> (s, "sub_octave", "Octave");
-    sub.add<Choice> (s, "sub_wave", "Wave");
-
     ampEnv.add<Knob> (s, ids::env (0, "a"), "Attack");
     ampEnv.add<Knob> (s, ids::env (0, "d"), "Decay");
     ampEnv.add<Knob> (s, ids::env (0, "s"), "Sustain");
@@ -683,8 +828,23 @@ RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor&
 
     output.add<Knob> (s, "master", "Master");
 
-    for (auto* c : std::initializer_list<juce::Component*> { &sub, &ampEnv, &filter, &voice, &delay, &reverb, &macros, &output })
+    for (auto* c : std::initializer_list<juce::Component*> { &ampEnv, &filter, &voice, &delay, &reverb, &macros, &output })
         mainPage.addAndMakeVisible (c);
+
+    // --- Oscillator page ---
+    subNoise.add<Knob>   (s, "sub_level", "Sub");
+    subNoise.add<Choice> (s, "sub_octave", "Octave");
+    subNoise.add<Choice> (s, "sub_wave", "Wave");
+    subNoise.add<Knob>   (s, "noise_level", "Noise");
+    subNoise.add<Knob>   (s, "noise_colour", "Colour", true);
+    subNoise.add<juce::Component>();   // keeps the grid even
+
+    glide.add<Choice> (s, "voice_mode", "Voice");
+    glide.add<Choice> (s, "glide_mode", "Glide");
+    glide.add<Knob>   (s, "glide_time", "Time");
+
+    for (auto* c : std::initializer_list<juce::Component*> { &osc1, &osc2, &subNoise, &glide })
+        oscPage.addAndMakeVisible (c);
 
     // --- Modulation page ---
     for (int k = 0; k < numLfos; ++k)
@@ -703,6 +863,7 @@ RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor&
     modPage.addAndMakeVisible (envSection);
 
     addChildComponent (mainPage);
+    addChildComponent (oscPage);
     addChildComponent (modPage);
     addChildComponent (matrixPage);
 
@@ -747,11 +908,12 @@ void RefractAudioProcessorEditor::showLayer (int index)
 
 void RefractAudioProcessorEditor::showPage (int index)
 {
-    for (int i = 0; i < 3; ++i)
+    for (int i = 0; i < 4; ++i)
         pageTabs[(size_t) i].setToggleState (i == index, juce::dontSendNotification);
     mainPage.setVisible (index == 0);
-    modPage.setVisible (index == 1);
-    matrixPage.setVisible (index == 2);
+    oscPage.setVisible (index == 1);
+    modPage.setVisible (index == 2);
+    matrixPage.setVisible (index == 3);
 }
 
 void RefractAudioProcessorEditor::changeListenerCallback (juce::ChangeBroadcaster*)
@@ -853,6 +1015,7 @@ void RefractAudioProcessorEditor::resized()
     area.removeFromBottom (10);
 
     mainPage.setBounds (area);
+    oscPage.setBounds (area);
     modPage.setBounds (area);
     matrixPage.setBounds (area);
 
@@ -873,7 +1036,15 @@ void RefractAudioProcessorEditor::resized()
     // Main page: two rows
     auto page = mainPage.getLocalBounds();
     const int rowH = page.getHeight() / 2;
-    layoutRow (page.removeFromTop (rowH), { { &sub, 3 }, { &ampEnv, 4 }, { &filter, 3 }, { &voice, 3 } });
+    layoutRow (page.removeFromTop (rowH), { { &ampEnv, 4 }, { &filter, 3 }, { &voice, 3 } });
+
+    // Oscillator page: the two oscillators side by side, sub/noise and glide on the right
+    auto oscArea = oscPage.getLocalBounds();
+    auto right = oscArea.removeFromRight (oscArea.getWidth() * 22 / 100);
+    subNoise.setBounds (right.removeFromTop (right.getHeight() * 55 / 100).reduced (3));
+    glide.setBounds (right.reduced (3));
+    osc1.setBounds (oscArea.removeFromLeft (oscArea.getWidth() / 2).reduced (3));
+    osc2.setBounds (oscArea.reduced (3));
     layoutRow (page, { { &delay, 3 }, { &reverb, 3 }, { &macros, 4 }, { &output, 1 } });
 
     // Modulation page: LFOs on the left, envelopes on the right

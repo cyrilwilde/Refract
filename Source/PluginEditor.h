@@ -177,6 +177,44 @@ private:
 };
 
 //==============================================================================
+// Oscillator page
+//==============================================================================
+
+// One cycle of an oscillator's current waveform
+class OscScope : public juce::Component, private juce::Timer
+{
+public:
+    OscScope (RefractAudioProcessor& p, int oscIndex) : processor (p), osc (oscIndex) { startTimerHz (15); }
+    void paint (juce::Graphics&) override;
+private:
+    void timerCallback() override { if (isShowing()) repaint(); }
+    RefractAudioProcessor& processor;
+    const int osc;
+};
+
+class OscPanel : public Section, private juce::Timer
+{
+public:
+    OscPanel (RefractAudioProcessor& p, int oscIndex);
+    void resized() override;
+private:
+    void timerCallback() override;   // swaps analog / wavetable controls
+    RefractAudioProcessor& processor;
+    const int osc;
+    Toggle on;
+    Choice mode;
+    Knob wave;  Choice table;
+    Knob pulseWidth, position;
+    Knob level, pan;
+    Knob octave, semi, fine;
+    Knob unison, detune, spread, randomPhase;
+    std::unique_ptr<Toggle> sync;   // osc 2 only
+    std::unique_ptr<Knob> fm;       // osc 2 only
+    OscScope scope;
+    int shownMode = -1;
+};
+
+//==============================================================================
 // Everything for one sample layer: the sample view, painting tools, and the
 // layer's tuning / region / loop controls.
 //==============================================================================
@@ -221,6 +259,7 @@ private:
     Choice loopMode;
     Knob loopStart, loopEnd, crossfade;
     Toggle reverse;
+    Knob unison, detune, spread;
 
     std::unique_ptr<juce::FileChooser> chooser;
 };
@@ -251,13 +290,17 @@ private:
     std::array<std::unique_ptr<LayerPanel>, refract::numLayers> panels;
 
     // Bottom pages
-    std::array<juce::TextButton, 3> pageTabs;
-    juce::Component mainPage, modPage;
+    std::array<juce::TextButton, 4> pageTabs;
+    juce::Component mainPage, oscPage, modPage;
     ModMatrixPage matrixPage;
 
     // Main page
-    Section sub { "SUB" }, ampEnv { "AMP ENVELOPE" }, filter { "FILTER" }, voice { "VOICE" };
+    Section ampEnv { "AMP ENVELOPE" }, filter { "FILTER" }, voice { "VOICE" };
     Section delay { "DELAY" }, reverb { "REVERB" }, macros { "MACROS" }, output { "OUTPUT" };
+
+    // Oscillator page
+    OscPanel osc1, osc2;
+    Section subNoise { "SUB + NOISE", 2 }, glide { "VOICE MODE + GLIDE" };
 
     // Modulation page
     TabbedSection lfoSection, envSection;

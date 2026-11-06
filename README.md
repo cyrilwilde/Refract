@@ -158,6 +158,29 @@ Almost every dial can be modulated. The exceptions are on/off switches and drop-
 
 Note: in Freq mode the LFO is still updated 1,500 times a second (once every 32 samples). At audio-rate speeds it gives a gritty, stepped result rather than clean FM. Proper FM comes with the oscillators in Stage 3.
 
+### Oscillators, unison and glide (Stage 3, **OSC** page)
+
+- **Osc 1 and Osc 2.** Switch an oscillator **On** and choose its **Mode**:
+  - **Analog:** **Wave** morphs smoothly sine → triangle → saw → square, and **Pulse W** sets the width of the square. The edges are anti-aliased, so high notes stay clean.
+  - **Wavetable:** pick a **Table** and sweep **Position** through it.
+    - Built-in tables: Basic Shapes, PWM, Harmonic Sweep, Formant, Digital.
+    - **From Layer 1/2/3** turns that layer's sample into a wavetable. When the sample's pitch can be detected, each frame is exactly one cycle of it. Paint the spectrum or move the markers, and the table updates.
+  - **Octave / Semi / Fine** tune the oscillator. **Level / Pan** place it in the mix.
+  - **Unison** stacks up to 8 voices. **Detune** spreads their pitch (up to ±1 semitone; small settings are very fine), **Spread** spreads them across the stereo field, and **Rnd Phase** starts each voice at a random point. Keep it high for a wide supersaw, and turn it down for a punchier, more phase-aligned attack.
+  - **Osc 2 only:**
+    - **Sync** restarts Osc 2 every time Osc 1 starts a cycle. Sweep Osc 2's Semi or Octave (or modulate them) for classic sync leads.
+    - **FM** lets Osc 1 bend Osc 2's phase, for bells, metallic tones and growls. This is real audio-rate FM, unlike the LFO Freq mode.
+- **Sub + Noise.** The sub oscillator follows the note an octave or two down. **Noise** adds noise, and **Colour** goes from dark (−) through white (0) to bright (+).
+- **Voice mode.**
+  - **Poly** plays chords.
+  - **Mono** plays one note at a time and restarts the envelopes and samples on each new key.
+  - **Legato** is one note at a time too, but overlapping keys only change pitch, so you get smooth lines. Releasing a key goes back to the previous held key in both mono modes.
+- **Glide.**
+  - **Always** slides from the previous note every time.
+  - **Legato Only** slides only when keys overlap.
+  - **Time** is how long the slide takes, the same whatever the interval. Glide works in Poly too: each new note slides from the last one played.
+- **Sample layers have unison too**: **Unison** (up to 4 copies), **Detune** (up to ±50 cents) and **Spread**, on the right of the layer strip.
+
 ---
 
 ## Part 3: How it works
@@ -197,6 +220,7 @@ A plugin has two halves that run at the same time on different threads:
 | `CMakeLists.txt` | Build recipe: which formats to build, plugin IDs, universal binary settings. |
 | `Source/Parameters.h/.cpp` | Every automatable knob: its ID, range, default and how it's displayed. |
 | `Source/SampleData.h` | The loaded-sample type, and the lock-free "bank" the audio thread reads from. |
+| `Source/Wavetable.h/.cpp` | Wavetables: built-in tables, tables made from samples, anti-aliased mip levels. |
 | `Source/SpectralProcessor.h/.cpp` | The FFT maths: spectrogram picture, and rebuilding audio through the painted mask. |
 | `Source/SynthVoice.h/.cpp` | One playing note: sample playback, sub osc, envelopes, LFOs, filter, mod matrix. |
 | `Source/PluginProcessor.h/.cpp` | Ties it all together: voices, effects, background jobs, save/load. |
@@ -331,6 +355,24 @@ JUCE's `Synthesiser` class handles MIDI: it finds a free voice for each note-on 
   - A phase runs from 0 to 1. When it wraps, a new random level is picked (for Random) and a new jitter factor is chosen: `2^(jitter × random(-1..1))`, i.e. up to an octave faster or slower for that one cycle.
   - Smooth is a one-pole low-pass on the output, a filter that moves a fraction of the way towards its target each step. Its time constant is `smooth² × ½ cycle`. Squaring makes the low end of the dial gentle.
   - In Sync mode with Live playing, the phase is taken straight from the song position (`ppq ÷ beats per cycle`), so it can never drift off the beat.
+
+### 3.12 Stage 3: how the oscillators work
+
+- **Aliasing and PolyBLEP.** A digital saw or square has an instant jump. Mathematically that jump contains harmonics far above what the sample rate can hold, and they "fold back" as inharmonic whistles, worst on high notes. **PolyBLEP** (`polyBlep` in `SynthVoice.cpp`) adds a tiny pre-computed correction curve in the one or two samples around each jump, which removes most of the fold-back. A triangle has no jump (only a corner), so it barely aliases, and a sine has none at all.
+- **The analog morph.** `analogValue` works out the two neighbouring shapes (e.g. saw and square) and crossfades between them. Because Wave is a normal dial, every LFO and envelope can sweep it.
+- **Wavetables and mip levels** (`Wavetable.cpp`).
+  - A table is 32 frames of 2048 samples each. When a table is built, each frame is FFT'd, and 10 copies are made with fewer and fewer harmonics: all 1024, then 512, 256, and so on down to 2.
+  - While playing, `Wavetable::levelFor` picks the copy whose highest harmonic still fits below half the sample rate for that note. It's the same anti-aliasing idea as PolyBLEP, done ahead of time.
+  - Position crossfades between the two nearest frames.
+- **Tables from samples.** After a layer is loaded or painted, the background job runs the pitch detector on the result. If it finds a pitch, each frame is exactly one period of the sound, resampled to 2048 points, taken from 32 evenly spaced places through the sample. That's why a sung note or a string sample becomes a playable, morphing wavetable.
+- **Unison.** Each oscillator keeps 8 phases. Voice *u* of *n* sits at a position from −1 to +1 (`unisonPosition`), which sets both its detune (`2^(position × cents / 1200)`) and its pan. The total is divided by √n so adding voices doesn't make it much louder. Sample layers do the same with up to 4 read positions.
+- **Hard sync.** When an Osc 1 voice wraps from the end of its cycle back to the start, it records how far past the wrap it went (`wrapFraction`). The paired Osc 2 voice resets to that same point in its own cycle, so the reset happens at the exact sub-sample moment.
+- **FM** is done as phase modulation (the way the classic Yamaha DX synths work). Osc 1's last output, times the FM amount, is added to Osc 2's read position. The FM amount is squared so the low end of the dial gives subtle results.
+- **Glide.** The voice keeps `currentPitch` (in MIDI note numbers, fractions allowed) and moves it towards the key you pressed at a constant number of semitones per sample. The rate is set so the whole slide takes exactly Glide Time.
+- **Mono and Legato** (`RefractSynth::noteOn`/`noteOff`).
+  - JUCE's `Synthesiser` normally starts a fresh voice for every note. In these modes we always reuse voice 0 and keep a list of held keys.
+  - Before handing voice 0 its new note, we call `prepareLegato`. The voice then ignores the "stop immediately" that JUCE sends first, and only changes pitch (Legato) or restarts envelopes and samples smoothly (Mono).
+  - Releasing the current key hands the voice the most recent key still held.
 
 ---
 

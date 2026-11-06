@@ -71,6 +71,7 @@ RefractAudioProcessor::RefractAudioProcessor()
     shared.params = &params;
     shared.routing = &routing;
     shared.bank = &bank;
+    shared.wavetables = &wavetables;
     shared.playheads = &playheads;
     shared.leadOffsets.assign ((size_t) table.size(), 0.0f);
     synth.shared = &shared;
@@ -83,6 +84,18 @@ RefractAudioProcessor::RefractAudioProcessor()
     setModRouting (0, srcEnv2,     table.indexOf ("flt_cutoff"));
     setModRouting (1, srcLfo1,     table.indexOf ("voice_pitch"));
     setModRouting (2, srcModWheel, table.indexOf ("flt_cutoff"));
+
+    // The built-in wavetables take a moment to calculate, so build them in the
+    // background; oscillators in Wavetable mode stay silent until they're ready.
+    pool.addJob ([this]
+    {
+        for (int t = 0; t < numBuiltInTables; ++t)
+        {
+            auto table = makeBuiltInTable (t);
+            const juce::ScopedLock sl (publishLock);
+            wavetables.exchange (t, std::move (table));
+        }
+    });
 
     startTimerHz (2);
 }
@@ -326,6 +339,7 @@ void RefractAudioProcessor::clearSample (int layer)
         slot.missing = false;
     }
     publish (layer, gen, nullptr, nullptr);
+    publishWavetable (layer, gen, nullptr);
     sendChangeMessage();
 }
 
@@ -360,11 +374,13 @@ float RefractAudioProcessor::detectPitch (int layer) const
         const juce::ScopedLock sl (dataLock);
         data = layers[(size_t) layer].original;
     }
-    if (data == nullptr)
-        return -1.0f;
+    return data != nullptr ? detectPitchOf (*data) : -1.0f;
+}
 
-    const auto& audio = data->audio;
-    const double sr = data->sampleRate;
+float RefractAudioProcessor::detectPitchOf (const SampleData& sample)
+{
+    const auto& audio = sample.audio;
+    const double sr = sample.sampleRate;
     const int len = audio.getNumSamples();
     const int tauMin = juce::jmax (2, (int) (sr / 2000.0));   // up to ~2 kHz
     const int tauMax = (int) (sr / 40.0);                    // down to 40 Hz
@@ -508,7 +524,20 @@ void RefractAudioProcessor::startJob (int layer, bool reloadFile)
 
         // Step 3: hand the result to the audio thread (and its overview to the UI).
         if (! aborted)
+        {
             publish (layer, renderGen, playback, playback != nullptr ? makePeaks (playback->audio) : nullptr);
+
+            // A wavetable made from this sound, for the oscillators' "From Layer" tables.
+            // If the pitch is known, each frame is exactly one cycle of it.
+            WavetablePtr wt;
+            if (playback != nullptr)
+            {
+                const float midi = detectPitchOf (*playback);
+                const double period = midi > 0.0f ? playback->sampleRate / (440.0 * std::pow (2.0, (midi - 69.0) / 12.0)) : 0.0;
+                wt = makeTableFromSample (*playback, period);
+            }
+            publishWavetable (layer, renderGen, std::move (wt));
+        }
 
         --s.pendingJobs;
         sendChangeMessage();   // safe from any thread - the UI is updated later on the message thread
@@ -532,6 +561,15 @@ void RefractAudioProcessor::publish (int layer, int renderGen, SampleDataPtr pla
         graveyard.push_back (std::move (old));
 }
 
+void RefractAudioProcessor::publishWavetable (int layer, int renderGen, WavetablePtr table)
+{
+    const juce::ScopedLock sl (publishLock);
+    if (renderGen != layers[(size_t) layer].renderGeneration.load())
+        return;
+    if (auto old = wavetables.exchange (numBuiltInTables + layer, std::move (table)))
+        wavetableGraveyard.push_back (std::move (old));
+}
+
 void RefractAudioProcessor::timerCallback()
 {
     // An old sample is only referenced by the graveyard once no voice uses it
@@ -541,6 +579,9 @@ void RefractAudioProcessor::timerCallback()
     graveyard.erase (std::remove_if (graveyard.begin(), graveyard.end(),
                                      [] (const SampleDataPtr& p) { return p.use_count() <= 1; }),
                      graveyard.end());
+    wavetableGraveyard.erase (std::remove_if (wavetableGraveyard.begin(), wavetableGraveyard.end(),
+                                              [] (const WavetablePtr& p) { return p.use_count() <= 1; }),
+                              wavetableGraveyard.end());
 }
 
 RefractAudioProcessor::LayerDisplayInfo RefractAudioProcessor::getDisplayInfo (int layer) const

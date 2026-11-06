@@ -14,6 +14,7 @@
 #include "SampleData.h"
 #include "SpectralProcessor.h"
 #include "SynthVoice.h"
+#include "Wavetable.h"
 
 class RefractAudioProcessor : public juce::AudioProcessor,
                               public juce::ChangeBroadcaster,   // tells the UI "something changed"
@@ -72,6 +73,10 @@ public:
     // Estimates the pitch of a layer's sample as a (fractional) MIDI note,
     // or returns -1 if no clear pitch was found.
     float detectPitch (int layer) const;
+    static float detectPitchOf (const refract::SampleData& sample);
+
+    // For the oscillator display
+    refract::WavetablePtr getWavetable (int index) const { return wavetables.get (index); }
 
     // --- Modulation (message thread) ------------------------------------------
     const refract::ParamTable& getParamTable() const { return table; }
@@ -112,6 +117,7 @@ private:
 
     void startJob (int layer, bool reloadFile);
     void publish (int layer, int renderGeneration, refract::SampleDataPtr playback, refract::WaveformPeaksPtr peaks);
+    void publishWavetable (int layer, int renderGeneration, refract::WavetablePtr table);
     refract::SampleDataPtr readAudioFile (const juce::File& file);
     void timerCallback() override;   // frees replaced samples, off the audio thread
     void processDelay (juce::AudioBuffer<float>& buffer);
@@ -124,6 +130,7 @@ private:
     refract::ParamRefs params;
     refract::ModRouting routing;
     refract::PlaybackBank bank;
+    refract::WavetableBank wavetables;
     refract::PlayheadArray playheads;
     refract::VoiceShared shared;
     refract::RefractSynth synth;
@@ -138,6 +145,7 @@ private:
 
     juce::CriticalSection dataLock, publishLock;
     std::vector<refract::SampleDataPtr> graveyard;   // old samples waiting to be freed
+    std::vector<refract::WavetablePtr> wavetableGraveyard;
 
     // Effects
     juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> delay { 4 };

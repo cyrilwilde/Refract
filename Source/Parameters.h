@@ -37,6 +37,20 @@ namespace refract
         return juce::jlimit (0.0f, 1.0f, std::log (f / minMaskFreq) / std::log (maxMaskFreq / minMaskFreq));
     }
 
+    constexpr int numOscs     = 2;
+    constexpr int maxUnison   = 8;    // oscillator unison voices
+    constexpr int maxLayerUnison = 4; // sample layer unison copies
+
+    // Oscillators
+    enum OscMode   { oscAnalog = 0, oscWavetable };
+    inline juce::StringArray oscModeNames()   { return { "Analog", "Wavetable" }; }
+
+    // Voice modes and glide
+    enum VoiceMode { voicePoly = 0, voiceMono, voiceLegato };
+    enum GlideMode { glideOff = 0, glideAlways, glideLegato };
+    inline juce::StringArray voiceModeNames() { return { "Poly", "Mono", "Legato" }; }
+    inline juce::StringArray glideModeNames() { return { "Off", "Always", "Legato Only" }; }
+
     // How a layer's loop behaves (same idea as Ableton's Sampler)
     enum LoopMode { loopOff = 0, loopForward, loopPingPong, loopRelease };
     inline juce::StringArray loopModeNames() { return { "Off", "Forward", "Ping-Pong", "Fwd + Release" }; }
@@ -101,6 +115,7 @@ namespace refract
         inline juce::String env   (int index, const char* stage) { return (index == 0 ? juce::String ("amp") : "env" + juce::String (index + 1)) + "_" + stage; }
         inline juce::String modAmount (int slot) { return "mod" + juce::String (slot + 1) + "_amt"; }
         inline juce::String macro (int index) { return "macro" + juce::String (index + 1); }
+        inline juce::String osc   (int index, const char* name) { return "osc" + juce::String (index + 1) + "_" + name; }
     }
 
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
@@ -156,12 +171,22 @@ namespace refract
         {
             P on, loopMode, reverse;
             I level, pan, root, coarse, fine, start, end, loopStart, loopEnd, crossfade;
+            I unison, detune, spread;
+        };
+        struct Osc
+        {
+            P on, mode, table;
+            I wave, pulseWidth, position, octave, semi, fine, level, pan, unison, detune, spread, randomPhase;
         };
         struct Env { I attack, decay, sustain, release; };
         struct Lfo { P shape, mode, sync, retrig; I rate, ratio, depth, phase, jitter, smooth; };
 
         std::array<Layer, numLayers> layers;
         P subOctave, subWave;  I subLevel;
+        std::array<Osc, numOscs> oscs;
+        P osc2Sync;            I osc2Fm;
+        I noiseLevel, noiseColour;
+        P voiceMode, glideMode; I glideTime;
         std::array<Env, numEnvs> envs;
         std::array<Lfo, numLfos> lfos;
         P filterType;          I cutoff, resonance;

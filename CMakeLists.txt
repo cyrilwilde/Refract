@@ -41,6 +41,7 @@ juce_add_plugin(Refract
 target_sources(Refract PRIVATE
     Source/Parameters.cpp
     Source/SpectralProcessor.cpp
+    Source/Wavetable.cpp
     Source/SynthVoice.cpp
     Source/PluginProcessor.cpp
     Source/SpectralEditor.cpp

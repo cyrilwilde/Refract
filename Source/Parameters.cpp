@@ -1,4 +1,5 @@
 #include "Parameters.h"
+#include "Wavetable.h"
 
 namespace refract
 {
@@ -112,7 +113,47 @@ namespace refract
             addFloat  (l, ids::layer (i, "loopend"),   n + "Loop End",     { 0.0f, 1.0f }, 1.0f, "%");
             addFloat  (l, ids::layer (i, "xfade"),     n + "Loop Crossfade", { 0.0f, 0.5f }, 0.0f, "%");
             addBool   (l, ids::layer (i, "reverse"),   n + "Reverse", false);
+
+            // Unison: up to 4 slightly detuned copies of the sample, spread in stereo
+            l.add (std::make_unique<juce::AudioParameterInt> (pid (ids::layer (i, "unison")), n + "Unison", 1, maxLayerUnison, 1));
+            addFloat  (l, ids::layer (i, "detune"),    n + "Unison Detune", { 0.0f, 1.0f }, 0.2f);
+            addFloat  (l, ids::layer (i, "spread"),    n + "Unison Spread", { 0.0f, 1.0f }, 0.5f);
         }
+
+        // --- Oscillators ---------------------------------------------------
+        for (int o = 0; o < numOscs; ++o)
+        {
+            const auto n = "Osc " + juce::String (o + 1) + " ";
+            addBool   (l, ids::osc (o, "on"),    n + "On", false);
+            addChoice (l, ids::osc (o, "mode"),  n + "Mode", oscModeNames(), oscAnalog);
+            // Analog: Wave morphs sine (0) -> triangle (1) -> saw (2) -> square (3)
+            addFloat  (l, ids::osc (o, "wave"),  n + "Wave", { 0.0f, 3.0f }, 2.0f);
+            addFloat  (l, ids::osc (o, "pw"),    n + "Pulse Width", { 0.05f, 0.95f }, 0.5f, "%");
+            // Wavetable: which table, and where in it
+            addChoice (l, ids::osc (o, "table"), n + "Wavetable", wavetableNames(), 0);
+            addFloat  (l, ids::osc (o, "pos"),   n + "Position", { 0.0f, 1.0f }, 0.0f, "%");
+            l.add (std::make_unique<juce::AudioParameterInt> (pid (ids::osc (o, "oct")),  n + "Octave",   -3, 3, 0));
+            l.add (std::make_unique<juce::AudioParameterInt> (pid (ids::osc (o, "semi")), n + "Semitone", -12, 12, 0,
+                       juce::AudioParameterIntAttributes().withLabel ("st")));
+            addFloat  (l, ids::osc (o, "fine"),  n + "Fine", { -100.0f, 100.0f, 0.1f }, 0.0f, "ct");
+            addFloat  (l, ids::osc (o, "level"), n + "Level", { 0.0f, 1.0f }, 0.7f);
+            addFloat  (l, ids::osc (o, "pan"),   n + "Pan", { -1.0f, 1.0f }, 0.0f);
+            l.add (std::make_unique<juce::AudioParameterInt> (pid (ids::osc (o, "unison")), n + "Unison", 1, maxUnison, 1));
+            addFloat  (l, ids::osc (o, "detune"), n + "Unison Detune", { 0.0f, 1.0f }, 0.25f);
+            addFloat  (l, ids::osc (o, "spread"), n + "Unison Spread", { 0.0f, 1.0f }, 0.7f);
+            addFloat  (l, ids::osc (o, "rphase"), n + "Random Phase", { 0.0f, 1.0f }, 1.0f);
+        }
+        addBool  (l, "osc2_sync", "Osc 2 Hard Sync", false);
+        addFloat (l, "osc2_fm",   "Osc 2 FM Amount", { 0.0f, 1.0f }, 0.0f);
+
+        // --- Noise ------------------------------------------------------------
+        addFloat (l, "noise_level",  "Noise Level",  { 0.0f, 1.0f }, 0.0f);
+        addFloat (l, "noise_colour", "Noise Colour", { -1.0f, 1.0f }, 0.0f);
+
+        // --- Voice mode and glide ------------------------------------------
+        addChoice (l, "voice_mode", "Voice Mode", voiceModeNames(), voicePoly);
+        addChoice (l, "glide_mode", "Glide",      glideModeNames(), glideOff);
+        addFloat  (l, "glide_time", "Glide Time", skewed (0.001f, 5.0f, 0.3f), 0.1f, "s");
 
         // --- Sub oscillator -----------------------------------------------
         addFloat  (l, "sub_level",  "Sub Level", { 0.0f, 1.0f }, 0.0f);
@@ -185,6 +226,10 @@ namespace refract
             for (int i = 0; i < numLayers; ++i)
                 if (id.startsWith ("l" + juce::String (i + 1) + "_")) return "Layer " + juce::String (i + 1);
             if (id.startsWith ("sub_"))   return "Sub";
+            if (id.startsWith ("osc1_"))  return "Osc 1";
+            if (id.startsWith ("osc2_"))  return "Osc 2";
+            if (id.startsWith ("noise_")) return "Noise";
+            if (id.startsWith ("glide_")) return "Voice";
             if (id.startsWith ("voice_")) return "Voice";
             if (id.startsWith ("amp_"))   return "Amp Env";
             for (int e = 1; e < numEnvs; ++e)
@@ -269,7 +314,37 @@ namespace refract
             L.loopStart = idx (ids::layer (i, "loopstart"));
             L.loopEnd   = idx (ids::layer (i, "loopend"));
             L.crossfade = idx (ids::layer (i, "xfade"));
+            L.unison    = idx (ids::layer (i, "unison"));
+            L.detune    = idx (ids::layer (i, "detune"));
+            L.spread    = idx (ids::layer (i, "spread"));
         }
+
+        for (int o = 0; o < numOscs; ++o)
+        {
+            auto& O = oscs[(size_t) o];
+            O.on          = raw (ids::osc (o, "on"));
+            O.mode        = raw (ids::osc (o, "mode"));
+            O.table       = raw (ids::osc (o, "table"));
+            O.wave        = idx (ids::osc (o, "wave"));
+            O.pulseWidth  = idx (ids::osc (o, "pw"));
+            O.position    = idx (ids::osc (o, "pos"));
+            O.octave      = idx (ids::osc (o, "oct"));
+            O.semi        = idx (ids::osc (o, "semi"));
+            O.fine        = idx (ids::osc (o, "fine"));
+            O.level       = idx (ids::osc (o, "level"));
+            O.pan         = idx (ids::osc (o, "pan"));
+            O.unison      = idx (ids::osc (o, "unison"));
+            O.detune      = idx (ids::osc (o, "detune"));
+            O.spread      = idx (ids::osc (o, "spread"));
+            O.randomPhase = idx (ids::osc (o, "rphase"));
+        }
+        osc2Sync    = raw ("osc2_sync");
+        osc2Fm      = idx ("osc2_fm");
+        noiseLevel  = idx ("noise_level");
+        noiseColour = idx ("noise_colour");
+        voiceMode   = raw ("voice_mode");
+        glideMode   = raw ("glide_mode");
+        glideTime   = idx ("glide_time");
 
         subLevel  = idx ("sub_level");
         subOctave = raw ("sub_octave");
