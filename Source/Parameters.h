@@ -51,6 +51,15 @@ namespace refract
     inline juce::StringArray voiceModeNames() { return { "Poly", "Mono", "Legato" }; }
     inline juce::StringArray glideModeNames() { return { "Off", "Always", "Legato Only" }; }
 
+    // Mixer: every sound in a voice, in this order
+    constexpr int numMixSources = 7;   // Layer 1-3, Osc 1-2, Sub, Noise
+    inline juce::StringArray mixSourceKeys()  { return { "l1", "l2", "l3", "osc1", "osc2", "sub", "noise" }; }
+    inline juce::StringArray mixSourceNames() { return { "Layer 1", "Layer 2", "Layer 3", "Osc 1", "Osc 2", "Sub", "Noise" }; }
+    enum MixRoute { routeFilter1 = 0, routeFilter2, routeNoFilter };
+    inline juce::StringArray mixRouteNames()  { return { "Filter 1", "Filter 2", "No Filter" }; }
+
+    constexpr int numBuses = 2, numFxSlots = 3;
+
     // How a layer's loop behaves (same idea as Ableton's Sampler)
     enum LoopMode { loopOff = 0, loopForward, loopPingPong, loopRelease };
     inline juce::StringArray loopModeNames() { return { "Off", "Forward", "Ping-Pong", "Fwd + Release" }; }
@@ -117,6 +126,9 @@ namespace refract
         inline juce::String macro (int index) { return "macro" + juce::String (index + 1); }
         inline juce::String osc   (int index, const char* name) { return "osc" + juce::String (index + 1) + "_" + name; }
         inline juce::String filter (int index, const char* name) { return "flt" + juce::String (index + 1) + "_" + name; }
+        inline juce::String mix (int source, const char* name) { return "mix_" + mixSourceKeys()[source] + "_" + name; }
+        inline juce::String bus (int b) { return juce::String (b == 0 ? "busA" : "busB"); }
+        inline juce::String fx  (int b, int slot, const char* name) { return bus (b) + "_s" + juce::String (slot + 1) + "_" + name; }
     }
 
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
@@ -196,7 +208,16 @@ namespace refract
         I pitch, pan, voiceLevel;
         std::array<P, numModSlots> modAmounts;
         std::array<P, numMacros> macros;
-        I delayTime, delayFeedback, delayMix, reverbSize, reverbDamping, reverbMix, master;
+        // Mixer
+        struct MixSource { P route; I sendA, sendB; };
+        std::array<MixSource, numMixSources> mix;
+        I subPan, noisePan, voiceSendA, voiceSendB;
+
+        // FX buses
+        struct FxSlot { P type, delayMode, sync, division; I p1, p2, p3, p4, mix; };
+        std::array<std::array<FxSlot, numFxSlots>, numBuses> fx;
+        std::array<I, numBuses> busReturn;
+        I master;
 
         ParamRefs (juce::AudioProcessorValueTreeState& state, const ParamTable& table);
     };

@@ -487,6 +487,173 @@ void PresetBar::resized()
 }
 
 //==============================================================================
+//  Mixer page
+//==============================================================================
+MixerPage::MixerPage (RefractAudioProcessor& p)
+{
+    auto& s = p.apvts;
+    // Level and pan IDs for each sound (they also live on the layer / osc panels)
+    const char* levelIds[] = { "l1_level", "l2_level", "l3_level", "osc1_level", "osc2_level", "sub_level", "noise_level", "voice_level" };
+    const char* panIds[]   = { "l1_pan", "l2_pan", "l3_pan", "osc1_pan", "osc2_pan", "mix_sub_pan", "mix_noise_pan", "voice_pan" };
+
+    for (int i = 0; i <= numMixSources; ++i)
+    {
+        auto& strip = strips[(size_t) i];
+        const bool voice = i == numMixSources;
+        styleLabel (strip.name, voice ? juce::String ("Voice (post)") : mixSourceNames()[i], false);
+        strip.level = std::make_unique<Knob> (s, levelIds[i], "Level");
+        strip.pan   = std::make_unique<Knob> (s, panIds[i], "Pan", true);
+        strip.sendA = std::make_unique<Knob> (s, voice ? juce::String ("mix_voice_sendA") : ids::mix (i, "sendA"), "Send A");
+        strip.sendB = std::make_unique<Knob> (s, voice ? juce::String ("mix_voice_sendB") : ids::mix (i, "sendB"), "Send B");
+        if (! voice)
+            strip.route = std::make_unique<Choice> (s, ids::mix (i, "route"), "To");
+
+        addAndMakeVisible (strip.name);
+        addAndMakeVisible (*strip.level);
+        addAndMakeVisible (*strip.pan);
+        addAndMakeVisible (*strip.sendA);
+        addAndMakeVisible (*strip.sendB);
+        if (strip.route != nullptr) addAndMakeVisible (*strip.route);
+    }
+    strips[(size_t) numMixSources].sendA->slider.setTooltip ("Sends the whole voice, after the filters, to Bus A");
+
+    styleLabel (returnsLabel, "Returns", false);
+    returnA = std::make_unique<Knob> (s, "busA_return", "Bus A");
+    returnB = std::make_unique<Knob> (s, "busB_return", "Bus B");
+    master  = std::make_unique<Knob> (s, "master", "Master");
+    for (auto* c : std::initializer_list<juce::Component*> { &returnsLabel, returnA.get(), returnB.get(), master.get() })
+        addAndMakeVisible (c);
+}
+
+void MixerPage::paint (juce::Graphics& g)
+{
+    drawPanel (g, getLocalBounds().toFloat().reduced (1.0f));
+    // Faint dividers between strips
+    const int columns = numMixSources + 2;
+    const float w = (float) (getWidth() - 20) / (float) columns;
+    g.setColour (colours::panelEdge);
+    for (int i = 1; i < columns; ++i)
+        g.drawVerticalLine ((int) (10.0f + w * (float) i), 10.0f, (float) getHeight() - 10.0f);
+}
+
+void MixerPage::resized()
+{
+    auto area = getLocalBounds().reduced (10);
+    const int columns = numMixSources + 2;
+    const int w = area.getWidth() / columns;
+
+    for (auto& strip : strips)
+    {
+        auto col = area.removeFromLeft (w).reduced (4, 0);
+        strip.name.setBounds (col.removeFromTop (18));
+        const int h = col.getHeight() / 5;
+        strip.level->setBounds (col.removeFromTop (h));
+        strip.pan->setBounds (col.removeFromTop (h));
+        auto routeArea = col.removeFromTop (h);
+        if (strip.route != nullptr) strip.route->setBounds (routeArea);
+        strip.sendA->setBounds (col.removeFromTop (h));
+        strip.sendB->setBounds (col);
+    }
+
+    auto col = area.reduced (4, 0);
+    returnsLabel.setBounds (col.removeFromTop (18));
+    const int h = col.getHeight() / 3;
+    returnA->setBounds (col.removeFromTop (h));
+    returnB->setBounds (col.removeFromTop (h));
+    master->setBounds (col);
+}
+
+//==============================================================================
+//  FX page
+//==============================================================================
+FxSlotPanel::FxSlotPanel (RefractAudioProcessor& p, int b, int s)
+    : processor (p), bus (b), slot (s),
+      type     (p.apvts, ids::fx (b, s, "type"),  "FX " + juce::String (s + 1)),
+      mode     (p.apvts, ids::fx (b, s, "dmode"), "Mode"),
+      sync     (p.apvts, ids::fx (b, s, "sync"),  "Sync"),
+      division (p.apvts, ids::fx (b, s, "div"),   "Time"),
+      p1       (p.apvts, ids::fx (b, s, "p1"),    "P1"),
+      p2       (p.apvts, ids::fx (b, s, "p2"),    "P2"),
+      p3       (p.apvts, ids::fx (b, s, "p3"),    "P3"),
+      p4       (p.apvts, ids::fx (b, s, "p4"),    "P4"),
+      mix      (p.apvts, ids::fx (b, s, "mix"),   "Mix")
+{
+    for (auto* c : std::initializer_list<juce::Component*> { &type, &mode, &sync, &division, &p1, &p2, &p3, &p4, &mix })
+        addAndMakeVisible (c);
+    sync.button.setTooltip ("On: delay time follows Live's tempo. Off: set it in milliseconds with the Time dial.");
+    timerCallback();
+    startTimerHz (8);
+}
+
+void FxSlotPanel::timerCallback()
+{
+    auto get = [this] (const char* n) { return processor.apvts.getRawParameterValue (ids::fx (bus, slot, n))->load(); };
+    const int t = (int) get ("type"), m = (int) get ("dmode"), sy = get ("sync") > 0.5f ? 1 : 0;
+    if (t == shownType && m == shownMode && sy == shownSync)
+        return;
+    shownType = t; shownMode = m; shownSync = sy;
+
+    const auto labels = fxKnobLabels (t, m);
+    Knob* knobs[] = { &p1, &p2, &p3, &p4 };
+    for (int i = 0; i < 4; ++i)
+    {
+        knobs[i]->label.setText (labels[i], juce::dontSendNotification);
+        knobs[i]->setVisible (t != fxOff);
+    }
+    mix.setVisible (t != fxOff);
+
+    // Delay-only controls; when synced, the Time menu replaces the Time dial
+    const bool isDelay = t == fxDelay;
+    mode.setVisible (isDelay);
+    sync.setVisible (isDelay);
+    division.setVisible (isDelay && sy == 1);
+    p1.setVisible (t != fxOff && ! (isDelay && sy == 1));
+}
+
+void FxSlotPanel::paint (juce::Graphics& g)
+{
+    g.setColour (colours::background.withAlpha (0.5f));
+    g.fillRoundedRectangle (getLocalBounds().toFloat().reduced (1.0f), 5.0f);
+}
+
+void FxSlotPanel::resized()
+{
+    auto r = getLocalBounds().reduced (4, 2);
+    const int w = r.getWidth() / 8;
+    type.setBounds (r.removeFromLeft (w + w / 2).reduced (2));
+    mode.setBounds (r.removeFromLeft (w + w / 3).reduced (2));
+    sync.setBounds (r.removeFromLeft (w * 2 / 3).reduced (2));
+    const auto timeSlot = r.removeFromLeft (w).reduced (2);
+    p1.setBounds (timeSlot);
+    division.setBounds (timeSlot);
+    const int rest = r.getWidth() / 4;
+    for (auto* k : { &p2, &p3, &p4 })
+        k->setBounds (r.removeFromLeft (rest).reduced (2));
+    mix.setBounds (r.reduced (2));
+}
+
+FxBusPanel::FxBusPanel (RefractAudioProcessor& p, int b)
+    : Section (b == 0 ? "BUS A" : "BUS B"),
+      returnLevel (p.apvts, ids::bus (b) + "_return", "Return")
+{
+    for (int s = 0; s < numFxSlots; ++s)
+    {
+        slots[(size_t) s] = std::make_unique<FxSlotPanel> (p, b, s);
+        addAndMakeVisible (*slots[(size_t) s]);
+    }
+    addAndMakeVisible (returnLevel);
+}
+
+void FxBusPanel::resized()
+{
+    auto area = getContentArea();
+    returnLevel.setBounds (area.removeFromRight (64).withSizeKeepingCentre (64, 90));
+    const int h = area.getHeight() / numFxSlots;
+    for (auto& s : slots)
+        s->setBounds (area.removeFromTop (h).reduced (0, 2));
+}
+
+//==============================================================================
 //  Oscillator page
 //==============================================================================
 void OscScope::paint (juce::Graphics& g)
@@ -862,7 +1029,8 @@ void LayerPanel::resized()
 //  The editor window
 //==============================================================================
 RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor& p)
-    : AudioProcessorEditor (&p), processor (p), presetBar (p), matrixPage (p),
+    : AudioProcessorEditor (&p), processor (p), presetBar (p),
+      mixerPage (p), busA (p, 0), busB (p, 1), matrixPage (p),
       osc1 (p, 0), osc2 (p, 1),
       lfoSection ("LFO", { "1", "2", "3", "4" }, 3001),
       envSection ("ENVELOPE", { "2", "3", "4" }, 3002)
@@ -887,8 +1055,8 @@ RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor&
     // Page tabs for the bottom half
     addAndMakeVisible (presetBar);
 
-    const char* pageNames[] = { "MAIN", "OSC", "FILTER", "MODULATION", "MATRIX" };
-    for (int i = 0; i < 5; ++i)
+    const char* pageNames[] = { "MAIN", "OSC", "FILTER", "MIXER", "FX", "MODULATION", "MATRIX" };
+    for (int i = 0; i < 7; ++i)
     {
         auto& tab = pageTabs[(size_t) i];
         tab.setButtonText (pageNames[i]);
@@ -926,20 +1094,16 @@ RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor&
     voice.add<Knob> (s, "voice_pan", "Pan", true);
     voice.add<Knob> (s, "voice_level", "Level");
 
-    delay.add<Knob> (s, "dly_time", "Time");
-    delay.add<Knob> (s, "dly_fb", "Feedback");
-    delay.add<Knob> (s, "dly_mix", "Mix");
-
-    reverb.add<Knob> (s, "rev_size", "Size");
-    reverb.add<Knob> (s, "rev_damp", "Damping");
-    reverb.add<Knob> (s, "rev_mix", "Mix");
 
     for (int m = 0; m < numMacros; ++m)
         macros.add<Knob> (s, ids::macro (m), "Macro " + juce::String (m + 1));
 
     output.add<Knob> (s, "master", "Master");
 
-    for (auto* c : std::initializer_list<juce::Component*> { &ampEnv, &voice, &delay, &reverb, &macros, &output })
+    fxPage.addAndMakeVisible (busA);
+    fxPage.addAndMakeVisible (busB);
+
+    for (auto* c : std::initializer_list<juce::Component*> { &ampEnv, &voice, &macros, &output })
         mainPage.addAndMakeVisible (c);
 
     // --- Oscillator page ---
@@ -976,6 +1140,8 @@ RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor&
     addChildComponent (mainPage);
     addChildComponent (oscPage);
     addChildComponent (filterPage);
+    addChildComponent (mixerPage);
+    addChildComponent (fxPage);
     addChildComponent (modPage);
     addChildComponent (matrixPage);
 
@@ -1020,13 +1186,15 @@ void RefractAudioProcessorEditor::showLayer (int index)
 
 void RefractAudioProcessorEditor::showPage (int index)
 {
-    for (int i = 0; i < 5; ++i)
+    for (int i = 0; i < 7; ++i)
         pageTabs[(size_t) i].setToggleState (i == index, juce::dontSendNotification);
     mainPage.setVisible (index == 0);
     oscPage.setVisible (index == 1);
     filterPage.setVisible (index == 2);
-    modPage.setVisible (index == 3);
-    matrixPage.setVisible (index == 4);
+    mixerPage.setVisible (index == 3);
+    fxPage.setVisible (index == 4);
+    modPage.setVisible (index == 5);
+    matrixPage.setVisible (index == 6);
 }
 
 void RefractAudioProcessorEditor::changeListenerCallback (juce::ChangeBroadcaster*)
@@ -1125,13 +1293,15 @@ void RefractAudioProcessorEditor::resized()
     area.removeFromTop (6);
     auto pageRow = area.removeFromTop (24);
     for (auto& tab : pageTabs)
-        tab.setBounds (pageRow.removeFromLeft (104).reduced (2, 0));
+        tab.setBounds (pageRow.removeFromLeft (100).reduced (2, 0));
     area.removeFromTop (4);
     area.removeFromBottom (10);
 
     mainPage.setBounds (area);
     oscPage.setBounds (area);
     filterPage.setBounds (area);
+    mixerPage.setBounds (area);
+    fxPage.setBounds (area);
     modPage.setBounds (area);
     matrixPage.setBounds (area);
 
@@ -1149,10 +1319,14 @@ void RefractAudioProcessorEditor::resized()
         }
     };
 
-    // Main page: two rows
+    // Main page: amp envelope, voice, macros, output
     auto page = mainPage.getLocalBounds();
-    const int rowH = page.getHeight() / 2;
-    layoutRow (page.removeFromTop (rowH), { { &ampEnv, 4 }, { &voice, 3 }, { &macros, 4 } });
+    layoutRow (page.withHeight (juce::jmin (page.getHeight(), 170)), { { &ampEnv, 4 }, { &voice, 3 }, { &macros, 4 }, { &output, 1 } });
+
+    // FX page: Bus A on the left, Bus B on the right
+    auto fxArea = fxPage.getLocalBounds();
+    busA.setBounds (fxArea.removeFromLeft (fxArea.getWidth() / 2).reduced (3));
+    busB.setBounds (fxArea.reduced (3));
 
     // Filter page: Filter 1 | routing | Filter 2
     auto fp = filterPage.getLocalBounds();
@@ -1167,7 +1341,7 @@ void RefractAudioProcessorEditor::resized()
     glide.setBounds (right.reduced (3));
     osc1.setBounds (oscArea.removeFromLeft (oscArea.getWidth() / 2).reduced (3));
     osc2.setBounds (oscArea.reduced (3));
-    layoutRow (page, { { &delay, 3 }, { &reverb, 3 }, { &output, 1 } });
+
 
     // Modulation page: LFOs on the left, envelopes on the right
     auto mod = modPage.getLocalBounds();

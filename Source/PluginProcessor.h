@@ -15,6 +15,7 @@
 #include "SpectralProcessor.h"
 #include "SynthVoice.h"
 #include "Wavetable.h"
+#include "Effects.h"
 
 class RefractAudioProcessor : public juce::AudioProcessor,
                               public juce::ChangeBroadcaster,   // tells the UI "something changed"
@@ -132,7 +133,7 @@ private:
     void publishWavetable (int layer, int renderGeneration, refract::WavetablePtr table);
     refract::SampleDataPtr readAudioFile (const juce::File& file);
     void timerCallback() override;   // frees replaced samples, off the audio thread
-    void processDelay (juce::AudioBuffer<float>& buffer);
+    void renderChunk (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi, int numSamples);
     void updateHostInfo();
     juce::ValueTree createStateTree();
     void restoreStateTree (const juce::ValueTree& root);
@@ -164,9 +165,9 @@ private:
     std::vector<refract::WavetablePtr> wavetableGraveyard;
 
     // Effects
-    juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> delay { 4 };
-    juce::SmoothedValue<float> delaySamples;
-    juce::dsp::Reverb reverb;
+    juce::AudioBuffer<float> work;   // main + bus A + bus B (6 channels)
+    int maxBlock = 512;
+    std::array<std::array<refract::FxSlot, refract::numFxSlots>, refract::numBuses> fxSlots;
     juce::dsp::Gain<float> master;
     double currentSampleRate = 44100.0;
 

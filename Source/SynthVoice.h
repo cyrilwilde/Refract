@@ -244,6 +244,12 @@ namespace refract
         float  subGain = 0.0f, subStep = 0.0f, subPanL = 1.0f, subPanR = 1.0f;
         float  noiseGain = 0.0f, noiseStep = 0.0f, noiseLp = 0.0f, noiseLpCoef = 1.0f, noiseHpMix = 0.0f;
 
+        // Mixer
+        std::array<int, numMixSources> routes {};
+        std::array<float, numMixSources> sendA {}, sendB {};
+        float voiceSendA = 0.0f, voiceSendB = 0.0f;
+        float noisePanL = 1.0f, noisePanR = 1.0f;
+
         std::array<VoiceFilter, 2> filters;
         std::array<float, 2> filterMix { 1.0f, 1.0f };
         int filterRouting = routeSerial;

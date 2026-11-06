@@ -459,7 +459,7 @@ namespace refract
             const int octave = (int) P.subOctave->load() - 2;          // choices: -2, -1, 0
             subIncrement = baseHz * std::pow (2.0, octave) / sampleRate;
             subWave = (int) P.subWave->load();
-            panGains (voicePan, subPanL, subPanR);
+            panGains (voicePan + v (P.subPan), subPanL, subPanR);
             subStep = (v (P.subLevel) - subGain) / (float) n;
         }
 
@@ -469,6 +469,20 @@ namespace refract
             if (colour < 0.0f) { noiseLpCoef = onePoleCoef (20000.0 * std::pow (2.0, (double) colour * 7.0), sampleRate); noiseHpMix = -1.0f; }
             else               { noiseLpCoef = onePoleCoef (1500.0, sampleRate); noiseHpMix = colour; }
             noiseStep = (v (P.noiseLevel) - noiseGain) / (float) n;
+            panGains (voicePan + v (P.noisePan), noisePanL, noisePanR);
+        }
+
+        // --- Mixer routing and sends ---
+        {
+            for (int s = 0; s < numMixSources; ++s)
+            {
+                const auto& M = P.mix[(size_t) s];
+                routes[(size_t) s] = (int) M.route->load();
+                sendA[(size_t) s] = v (M.sendA);
+                sendB[(size_t) s] = v (M.sendB);
+            }
+            voiceSendA = v (P.voiceSendA);
+            voiceSendB = v (P.voiceSendB);
         }
 
         // --- Filters ---
@@ -588,11 +602,13 @@ namespace refract
 
             for (int i = 0; i < n; ++i)
             {
-                float left = 0.0f, right = 0.0f;
+                // Each sound is kept separate until the mixer stage below
+                float srcL[numMixSources] = {}, srcR[numMixSources] = {};
 
                 // --- Sample layers (each with 1-4 unison copies) ---
-                for (auto& ls : layers)
+                for (int li = 0; li < numLayers; ++li)
                 {
+                    auto& ls = layers[(size_t) li];
                     ls.gain += ls.gainStep;
                     if (ls.data == nullptr)
                         continue;
@@ -625,8 +641,8 @@ namespace refract
                             rr = rr * fadeOut + readSample (buf, 1, p2) * fadeIn;
                         }
 
-                        left  += l  * ls.gain * r.panL;
-                        right += rr * ls.gain * r.panR;
+                        srcL[li] += l  * ls.gain * r.panL;
+                        srcR[li] += rr * ls.gain * r.panR;
 
                         // Move the read position, handling loops
                         r.position += ls.increment * r.ratio * (double) r.direction;
@@ -657,8 +673,8 @@ namespace refract
                 }
 
                 // --- Oscillators (osc 1 first: osc 2 may sync to it or be FM'd by it) ---
-                if (runOsc1)     renderOsc (osc1, left, right, nullptr, 0.0f, false);
-                if (osc2Running) renderOsc (osc2, left, right, &osc1, fm, sync);
+                if (runOsc1)     renderOsc (osc1, srcL[3], srcR[3], nullptr, 0.0f, false);
+                if (osc2Running) renderOsc (osc2, srcL[4], srcR[4], &osc1, fm, sync);
 
                 // --- Sub oscillator ---
                 subGain += subStep;
@@ -669,8 +685,8 @@ namespace refract
                     if (subWave == 0)      s = std::sin (juce::MathConstants<float>::twoPi * ph);
                     else if (subWave == 1) s = 1.0f - 4.0f * std::abs (ph - 0.5f);
                     else                   s = (ph < 0.5f ? 0.6f : -0.6f);   // square, a bit quieter
-                    left  += s * subGain * subPanL;
-                    right += s * subGain * subPanR;
+                    srcL[5] = s * subGain * subPanL;
+                    srcR[5] = s * subGain * subPanR;
                 }
                 subPhase += subIncrement;
                 if (subPhase >= 1.0) subPhase -= std::floor (subPhase);
@@ -682,42 +698,64 @@ namespace refract
                     const float white = random.nextFloat() * 2.0f - 1.0f;
                     noiseLp += (white - noiseLp) * noiseLpCoef;
                     const float s = noiseHpMix < 0.0f ? noiseLp : white - noiseLp * noiseHpMix;
-                    left  += s * noiseGain * 0.5f * subPanL;
-                    right += s * noiseGain * 0.5f * subPanR;
+                    srcL[6] = s * noiseGain * 0.5f * noisePanL;
+                    srcR[6] = s * noiseGain * 0.5f * noisePanR;
                 }
 
-                // --- Filters (serial: 1 then 2; parallel: both, averaged), then the amp envelope ---
+                // --- Mixer: each sound goes to Filter 1, Filter 2 or straight out,
+                //     and can also be sent (before the filters) to Bus A / Bus B ---
+                float f1L = 0.0f, f1R = 0.0f, f2L = 0.0f, f2R = 0.0f, dryL = 0.0f, dryR = 0.0f;
+                float aL = 0.0f, aR = 0.0f, bL = 0.0f, bR = 0.0f;
+                for (int s = 0; s < numMixSources; ++s)
                 {
-                    auto run = [this] (int f, int ch, float x)
+                    const float l = srcL[s], r = srcR[s];
+                    switch (routes[(size_t) s])
                     {
-                        const float wet = filters[(size_t) f].process (ch, x);
-                        return x + filterMix[(size_t) f] * (wet - x);   // Mix: dry <-> filtered
-                    };
-                    const bool on1 = filters[0].isActive(), on2 = filters[1].isActive();
-                    if (filterRouting == routeSerial || ! (on1 && on2))
-                    {
-                        if (on1) { left = run (0, 0, left); right = run (0, 1, right); }
-                        if (on2) { left = run (1, 0, left); right = run (1, 1, right); }
+                        case routeFilter1: f1L += l; f1R += r; break;
+                        case routeFilter2: f2L += l; f2R += r; break;
+                        default:           dryL += l; dryR += r; break;
                     }
-                    else
-                    {
-                        left  = 0.5f * (run (0, 0, left)  + run (1, 0, left));
-                        right = 0.5f * (run (0, 1, right) + run (1, 1, right));
-                    }
+                    aL += l * sendA[(size_t) s]; aR += r * sendA[(size_t) s];
+                    bL += l * sendB[(size_t) s]; bR += r * sendB[(size_t) s];
                 }
 
+                // --- Filters. Serial: Filter 1's output carries on into Filter 2.
+                //     Parallel: the two filter their own inputs side by side. ---
+                auto run = [this] (int f, int ch, float x)
+                {
+                    const float wet = filters[(size_t) f].process (ch, x);
+                    return x + filterMix[(size_t) f] * (wet - x);   // Mix: dry <-> filtered
+                };
+                const float y1L = run (0, 0, f1L), y1R = run (0, 1, f1R);
+                const bool serial = filterRouting == routeSerial;
+                const float y2L = run (1, 0, f2L + (serial ? y1L : 0.0f));
+                const float y2R = run (1, 1, f2R + (serial ? y1R : 0.0f));
+                const float mainL = dryL + y2L + (serial ? 0.0f : y1L);
+                const float mainR = dryR + y2R + (serial ? 0.0f : y1R);
+
+                // Post-filter sends of the whole voice
+                aL += mainL * voiceSendA; aR += mainR * voiceSendA;
+                bL += mainL * voiceSendB; bR += mainR * voiceSendB;
+
+                // --- Amp envelope, then out to the main mix and the two buses ---
                 for (int e = 0; e < numEnvs; ++e)
                     envValues[(size_t) e] = envs[(size_t) e].getNextSample();
                 const float g = envValues[0] * ampGain * 0.5f;   // 0.5 = headroom for chords
+                const int idx = startSample + i;
 
-                if (outChannels > 1)
+                if (outChannels >= 6)
                 {
-                    output.addSample (0, startSample + i, left * g);
-                    output.addSample (1, startSample + i, right * g);
+                    output.addSample (0, idx, mainL * g); output.addSample (1, idx, mainR * g);
+                    output.addSample (2, idx, aL * g);    output.addSample (3, idx, aR * g);
+                    output.addSample (4, idx, bL * g);    output.addSample (5, idx, bR * g);
+                }
+                else if (outChannels > 1)
+                {
+                    output.addSample (0, idx, mainL * g); output.addSample (1, idx, mainR * g);
                 }
                 else if (outChannels == 1)
                 {
-                    output.addSample (0, startSample + i, (left + right) * 0.5f * g);
+                    output.addSample (0, idx, (mainL + mainR) * 0.5f * g);
                 }
             }
 

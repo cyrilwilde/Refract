@@ -123,13 +123,12 @@ void RefractAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBloc
 
     const juce::dsp::ProcessSpec spec { sampleRate, (juce::uint32) samplesPerBlock, 2 };
 
-    delay.setMaximumDelayInSamples ((int) (sampleRate * 2.1));
-    delay.prepare (spec);
-    delaySamples.reset (sampleRate, 0.25);   // glide delay-time changes over 250 ms
-    delaySamples.setCurrentAndTargetValue (table.value (params.delayTime, 0.0f) * 0.001f * (float) sampleRate);
-
-    reverb.prepare (spec);
-    reverb.reset();
+    // Voices render into 6 channels: main L/R, Bus A L/R, Bus B L/R
+    maxBlock = juce::jmax (1, samplesPerBlock);
+    work.setSize (6, maxBlock, false, true, false);
+    for (auto& bus : fxSlots)
+        for (auto& slot : bus)
+            slot.prepare (sampleRate, maxBlock);
 
     master.prepare (spec);
     master.setRampDurationSeconds (0.05);
@@ -212,55 +211,82 @@ void RefractAudioProcessor::computeGlobalModulation (int numSamples)
 void RefractAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
 {
     juce::ScopedNoDenormals noDenormals;   // stops tiny numbers slowing the CPU to a crawl
-    buffer.clear();
     updateHostInfo();
 
-    // 1. Voices: MIDI in, audio out (each voice also reports if it's the newest note)
-    shared.leadActive = false;
-    synth.renderNextBlock (buffer, midi, 0, buffer.getNumSamples());
+    // Hosts occasionally send bigger blocks than they promised; handle those in pieces
+    const int total = buffer.getNumSamples();
+    if (buffer.getNumChannels() == 0 || total == 0)
+        return;
+    for (int start = 0; start < total; start += maxBlock)
+    {
+        const int n = juce::jmin (maxBlock, total - start);
+        juce::MidiBuffer chunkMidi;
+        if (n == total)
+            chunkMidi.swapWith (midi);
+        else
+            for (const auto m : midi)
+                if (m.samplePosition >= start && m.samplePosition < start + n)
+                    chunkMidi.addEvent (m.getMessage(), m.samplePosition - start);
 
-    // 2. Modulation for the effects
-    computeGlobalModulation (buffer.getNumSamples());
-
-    // 3. Delay
-    processDelay (buffer);
-
-    // 4. Reverb
-    juce::dsp::Reverb::Parameters rp;
-    rp.roomSize = gv (params.reverbSize);
-    rp.damping  = gv (params.reverbDamping);
-    rp.wetLevel = gv (params.reverbMix);
-    rp.dryLevel = 1.0f - rp.wetLevel * 0.5f;
-    rp.width    = 1.0f;
-    reverb.setParameters (rp);
-
-    juce::dsp::AudioBlock<float> block (buffer);
-    juce::dsp::ProcessContextReplacing<float> context (block);
-    reverb.process (context);
-
-    // 5. Master volume
-    master.setGainDecibels (gv (params.master));
-    master.process (context);
+        float* outs[2] = { buffer.getWritePointer (0), buffer.getNumChannels() > 1 ? buffer.getWritePointer (1) : nullptr };
+        juce::AudioBuffer<float> view (outs, buffer.getNumChannels() > 1 ? 2 : 1, start, n);
+        renderChunk (view, chunkMidi, n);
+        if (n == total)
+            chunkMidi.swapWith (midi);
+    }
 }
 
-void RefractAudioProcessor::processDelay (juce::AudioBuffer<float>& buffer)
+void RefractAudioProcessor::renderChunk (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi, int numSamples)
 {
-    const float feedback = gv (params.delayFeedback);
-    const float mix      = gv (params.delayMix);
-    delaySamples.setTargetValue (juce::jlimit (1.0f, (float) currentSampleRate * 2.0f,
-                                               gv (params.delayTime) * 0.001f * (float) currentSampleRate));
+    work.clear (0, numSamples);
 
-    const int channels = juce::jmin (buffer.getNumChannels(), 2);
-    for (int i = 0; i < buffer.getNumSamples(); ++i)
+    // 1. Voices: MIDI in, audio out on 6 channels (each voice also reports if it's the newest note)
+    shared.leadActive = false;
+    synth.renderNextBlock (work, midi, 0, numSamples);
+
+    // 2. Modulation for the effects
+    computeGlobalModulation (numSamples);
+
+    // 3. The two FX buses: each runs its 3 slots in order, then returns to the main mix
+    for (int bus = 0; bus < numBuses; ++bus)
     {
-        const float d = delaySamples.getNextValue();
-        for (int ch = 0; ch < channels; ++ch)
+        float* L = work.getWritePointer (2 + bus * 2);
+        float* R = work.getWritePointer (3 + bus * 2);
+        for (int s = 0; s < numFxSlots; ++s)
         {
-            const float dry = buffer.getSample (ch, i);
-            const float wet = delay.popSample (ch, d);
-            delay.pushSample (ch, dry + wet * feedback);   // feed some of the echo back in
-            buffer.setSample (ch, i, dry + wet * mix);
+            const auto& F = params.fx[(size_t) bus][(size_t) s];
+            FxSettings fx;
+            fx.type      = (int) F.type->load();
+            fx.delayMode = (int) F.delayMode->load();
+            fx.sync      = F.sync->load() > 0.5f;
+            fx.division  = (int) F.division->load();
+            fx.p[0] = gv (F.p1); fx.p[1] = gv (F.p2); fx.p[2] = gv (F.p3); fx.p[3] = gv (F.p4);
+            fx.mix  = gv (F.mix);
+            fxSlots[(size_t) bus][(size_t) s].process (L, R, numSamples, fx, shared.host.bpm);
         }
+        const float ret = gv (params.busReturn[(size_t) bus]);
+        work.addFrom (0, 0, L, numSamples, ret);
+        work.addFrom (1, 0, R, numSamples, ret);
+    }
+
+    // 4. Master volume, then copy to Live's output
+    {
+        float* chans[2] = { work.getWritePointer (0), work.getWritePointer (1) };
+        juce::dsp::AudioBlock<float> block (chans, 2, (size_t) numSamples);
+        juce::dsp::ProcessContextReplacing<float> context (block);
+        master.setGainDecibels (gv (params.master));
+        master.process (context);
+    }
+    if (buffer.getNumChannels() >= 2)
+    {
+        buffer.copyFrom (0, 0, work, 0, 0, numSamples);
+        buffer.copyFrom (1, 0, work, 1, 0, numSamples);
+    }
+    else if (buffer.getNumChannels() == 1)
+    {
+        buffer.copyFrom (0, 0, work, 0, 0, numSamples);
+        buffer.addFrom (0, 0, work, 1, 0, numSamples);
+        buffer.applyGain (0.5f);
     }
 }
 

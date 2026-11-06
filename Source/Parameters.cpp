@@ -1,6 +1,7 @@
 #include "Parameters.h"
 #include "Wavetable.h"
 #include "Filters.h"
+#include "Effects.h"
 
 namespace refract
 {
@@ -208,13 +209,40 @@ namespace refract
         }
         addChoice (l, "flt_routing", "Filter Routing", filterRoutingNames(), routeSerial);
 
-        // --- Effects -------------------------------------------------------
-        addFloat (l, "dly_time", "Delay Time",     skewed (10.0f, 2000.0f, 350.0f), 375.0f, "ms");
-        addFloat (l, "dly_fb",   "Delay Feedback", { 0.0f, 0.95f }, 0.35f);
-        addFloat (l, "dly_mix",  "Delay Mix",      { 0.0f, 1.0f },  0.0f);
-        addFloat (l, "rev_size", "Reverb Size",    { 0.0f, 1.0f },  0.6f);
-        addFloat (l, "rev_damp", "Reverb Damping", { 0.0f, 1.0f },  0.4f);
-        addFloat (l, "rev_mix",  "Reverb Mix",     { 0.0f, 1.0f },  0.15f);
+        // --- Mixer: where each sound goes ---------------------------------------
+        for (int s = 0; s < numMixSources; ++s)
+        {
+            const auto n = mixSourceNames()[s] + " ";
+            addChoice (l, ids::mix (s, "route"), n + "Filter Route", mixRouteNames(), routeFilter1);
+            addFloat  (l, ids::mix (s, "sendA"), n + "Send A", { 0.0f, 1.0f }, 0.0f, "%");
+            addFloat  (l, ids::mix (s, "sendB"), n + "Send B", { 0.0f, 1.0f }, 0.0f, "%");
+        }
+        addFloat (l, "mix_sub_pan",     "Sub Pan",   { -1.0f, 1.0f }, 0.0f);
+        addFloat (l, "mix_noise_pan",   "Noise Pan", { -1.0f, 1.0f }, 0.0f);
+        addFloat (l, "mix_voice_sendA", "Voice Send A (post-filter)", { 0.0f, 1.0f }, 0.0f, "%");
+        addFloat (l, "mix_voice_sendB", "Voice Send B (post-filter)", { 0.0f, 1.0f }, 0.0f, "%");
+
+        // --- FX buses: 2 buses x 3 slots ------------------------------------------
+        for (int b = 0; b < numBuses; ++b)
+        {
+            const auto bn = juce::String (b == 0 ? "Bus A " : "Bus B ");
+            addFloat (l, ids::bus (b) + "_return", bn + "Return", { 0.0f, 1.0f }, 0.8f, "%");
+            for (int s = 0; s < numFxSlots; ++s)
+            {
+                const auto n = bn + "FX " + juce::String (s + 1) + " ";
+                // Sensible starting chain: Bus A = delay, Bus B = reverb
+                const int defType = s == 0 ? (b == 0 ? fxDelay : fxReverb) : fxOff;
+                addChoice (l, ids::fx (b, s, "type"),  n + "Type", fxTypeNames(), defType);
+                addFloat  (l, ids::fx (b, s, "p1"),    n + "P1", { 0.0f, 1.0f }, 0.5f, "%");
+                addFloat  (l, ids::fx (b, s, "p2"),    n + "P2", { 0.0f, 1.0f }, 0.4f, "%");
+                addFloat  (l, ids::fx (b, s, "p3"),    n + "P3", { 0.0f, 1.0f }, 0.7f, "%");
+                addFloat  (l, ids::fx (b, s, "p4"),    n + "P4", { 0.0f, 1.0f }, 0.3f, "%");
+                addFloat  (l, ids::fx (b, s, "mix"),   n + "Mix", { 0.0f, 1.0f }, 1.0f, "%");
+                addChoice (l, ids::fx (b, s, "dmode"), n + "Delay Mode", delayModeNames(), delayDigital);
+                addBool   (l, ids::fx (b, s, "sync"),  n + "Delay Sync", true);
+                addChoice (l, ids::fx (b, s, "div"),   n + "Delay Division", syncNames(), 8);   // 1/4 D
+            }
+        }
         addFloat (l, "master",   "Master",         { -36.0f, 6.0f, 0.1f }, -6.0f, "dB");
 
         // --- Macros: 4 free knobs to map in Live and use as mod sources ---
@@ -249,14 +277,15 @@ namespace refract
                 if (id.startsWith ("lfo" + juce::String (i + 1) + "_")) return "LFO " + juce::String (i + 1);
             if (id.startsWith ("flt1_"))  return "Filter 1";
             if (id.startsWith ("flt2_"))  return "Filter 2";
-            if (id.startsWith ("dly_"))   return "Delay";
-            if (id.startsWith ("rev_"))   return "Reverb";
+            if (id.startsWith ("mix_"))   return "Mixer";
+            if (id.startsWith ("busA_"))  return "Bus A";
+            if (id.startsWith ("busB_"))  return "Bus B";
             return "Output";
         }
 
         bool isGlobalParam (const juce::String& id)
         {
-            return id.startsWith ("dly_") || id.startsWith ("rev_") || id == "master";
+            return id.startsWith ("bus") || id == "master";
         }
     }
 
@@ -402,12 +431,30 @@ namespace refract
         for (int m = 0; m < numModSlots; ++m) modAmounts[(size_t) m] = raw (ids::modAmount (m));
         for (int m = 0; m < numMacros; ++m)   macros[(size_t) m]     = raw (ids::macro (m));
 
-        delayTime     = idx ("dly_time");
-        delayFeedback = idx ("dly_fb");
-        delayMix      = idx ("dly_mix");
-        reverbSize    = idx ("rev_size");
-        reverbDamping = idx ("rev_damp");
-        reverbMix     = idx ("rev_mix");
-        master        = idx ("master");
+        for (int s = 0; s < numMixSources; ++s)
+            mix[(size_t) s] = { raw (ids::mix (s, "route")), idx (ids::mix (s, "sendA")), idx (ids::mix (s, "sendB")) };
+        subPan     = idx ("mix_sub_pan");
+        noisePan   = idx ("mix_noise_pan");
+        voiceSendA = idx ("mix_voice_sendA");
+        voiceSendB = idx ("mix_voice_sendB");
+
+        for (int b = 0; b < numBuses; ++b)
+        {
+            busReturn[(size_t) b] = idx (ids::bus (b) + "_return");
+            for (int s = 0; s < numFxSlots; ++s)
+            {
+                auto& F = fx[(size_t) b][(size_t) s];
+                F.type      = raw (ids::fx (b, s, "type"));
+                F.delayMode = raw (ids::fx (b, s, "dmode"));
+                F.sync      = raw (ids::fx (b, s, "sync"));
+                F.division  = raw (ids::fx (b, s, "div"));
+                F.p1  = idx (ids::fx (b, s, "p1"));
+                F.p2  = idx (ids::fx (b, s, "p2"));
+                F.p3  = idx (ids::fx (b, s, "p3"));
+                F.p4  = idx (ids::fx (b, s, "p4"));
+                F.mix = idx (ids::fx (b, s, "mix"));
+            }
+        }
+        master = idx ("master");
     }
 }

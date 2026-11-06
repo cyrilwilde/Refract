@@ -222,6 +222,43 @@ Set a filter's Type to *Off* to bypass it.
 
 All of these dials can be modulated, like everything else.
 
+### Mixer and FX buses (Stage 5, **MIXER** and **FX** pages)
+
+**MIXER: one channel strip per sound** (Layers 1-3, Osc 1-2, Sub, Noise):
+
+- **Level** and **Pan**. These are the same dials as on the layer and oscillator panels.
+- **To** picks where the sound goes: **Filter 1**, **Filter 2**, or **No Filter**.
+  - In **Serial** routing (FILTER page), sounds sent to Filter 1 carry on through Filter 2 as well. Sounds sent to Filter 2 go through Filter 2 only.
+  - In **Parallel**, each filter only gets its own sounds.
+  - Example: put the sub on *No Filter* so the low end stays solid while you sweep the filter on everything else.
+- **Send A / Send B** send a copy of that sound to an FX bus. The copy is taken *before* the filters, after the sound's level and the amp envelope.
+- **Voice (post)** sends the whole voice *after* the filters, so the effects get the filtered sound.
+- **Returns:** how loud each bus comes back into the mix, plus the **Master** volume.
+
+**FX: two buses with three slots each.** Each slot can be any effect, processed top to bottom:
+
+| Effect | P1 | P2 | P3 | P4 |
+|---|---|---|---|---|
+| **Delay** | Time | Feedback | Tone (Pitch in Granular) | Width / Wow / Spray |
+| **Reverb** | Size | Damping | Width | Pre-Delay (up to 250 ms) |
+| **Chorus** | Rate | Depth | Feedback | Delay |
+| **Phaser** | Rate | Depth | Centre | Feedback |
+| **Distortion** | Drive | Shape (soft → hard → fold) | Tone | Output |
+| **Bitcrush** | Bits (16 → 2) | Downsample | Tone | Output |
+| **Filter** | Cutoff | Resonance | LP → BP → HP | Drive |
+
+**Delay modes:**
+- **Digital:** clean repeats.
+- **Ping-Pong:** repeats bounce left and right.
+- **Tape:** wobbly, warming repeats that saturate instead of exploding at high feedback.
+- **Granular:** the repeats are re-played as small grains, which you can pitch ±12 semitones and **Spray** (scatter in time and stereo). With feedback and Pitch up an octave, you get the classic "shimmer".
+
+**Delay time:** turn **Sync** on to pick a note length tied to Live's tempo (1/32 to 8 bars, dotted and triplet), or off to set the time in milliseconds.
+
+**Mix** blends dry and effect. On a bus you usually want 100 %, because the dry sound is already in the main mix.
+
+**Starting setup:** Bus A starts with a synced delay and Bus B with a reverb. Turn up a sound's Send A or Send B to hear them.
+
 ---
 
 ## Part 3: How it works
@@ -261,6 +298,7 @@ A plugin has two halves that run at the same time on different threads:
 | `CMakeLists.txt` | Build recipe: which formats to build, plugin IDs, universal binary settings. |
 | `Source/Parameters.h/.cpp` | Every automatable knob: its ID, range, default and how it's displayed. |
 | `Source/SampleData.h` | The loaded-sample type, and the lock-free "bank" the audio thread reads from. |
+| `Source/Effects.h` | The FX slot effects, including the 4-mode delay. |
 | `Source/Filters.h` | The filter models: SVF, Ladder, MS-20, Comb, Formant. |
 | `Source/Wavetable.h/.cpp` | Wavetables: built-in tables, tables made from samples, anti-aliased mip levels. |
 | `Source/SpectralProcessor.h/.cpp` | The FFT maths: spectrogram picture, and rebuilding audio through the painted mask. |
@@ -429,6 +467,21 @@ JUCE's `Synthesiser` class handles MIDI: it finds a free voice for each note-on 
 - **Formant:** three band-pass SVFs set to the first three formant frequencies of a sung vowel (e.g. "A" ≈ 730, 1090, 2440 Hz), crossfaded between neighbouring vowels by Shape.
 - **I checked the filter maths numerically** before building it in. The low-pass slopes are 12 / 24 dB per octave as expected, the resonance peaks sit at the cutoff, and nothing goes unstable.
 - **Presets** use the same code that saves your Live set (`createStateTree` / `restoreStateTree`), written to disk as readable XML. Loading a preset clears any layer the preset doesn't use, so you never get leftover samples from the previous sound.
+
+### 3.14 Stage 5: how the mixer and buses work
+
+- **Each voice now renders six channels:** main L/R, Bus A L/R and Bus B L/R. The processor gives JUCE's Synthesiser a 6-channel work buffer (`work`), and every voice adds its sound into all three pairs.
+- **Inside a voice,** each sound is kept separate (`srcL[]` / `srcR[]`) until the mixer stage. Each sound is then added into one of three sums: Filter 1's input, Filter 2's input, or dry. At the same time, it's multiplied by its send amounts into the two bus sums.
+  - Serial: `F2 input = F2's own sounds + F1's output`.
+  - Parallel: `main = dry + F1 out + F2 out`.
+  - The amp envelope is applied last, so sends follow each note's volume shape.
+- **Why are sends taken before the filters?** A filter mixes all its input sounds into one signal, so after it there's no way to say how much of the output came from the sub and how much from Osc 1. *Voice (post)* covers the other case by sending the filtered voice as a whole.
+- **The buses** run once for the whole plugin (not per voice) after all voices have played, in `renderChunk`. Each slot (`FxSlot` in `Effects.h`) contains every effect type, but runs only the selected one. Switching type resets the effect, so old echoes don't leak into the new one.
+- **The delay** uses a 5-second circular buffer per channel.
+  - *Ping-Pong* writes the left echo into the right channel's buffer and vice versa.
+  - *Tape* moves the read point with two sine waves (wow at 0.6 Hz, flutter at 7 Hz) and puts `tanh` saturation in the feedback.
+  - *Granular* starts an 80 ms grain every 20 ms from around the delay point. Each grain reads at `2^(semitones/12)` speed with a smooth Hann fade in and out, and the grains are fed back into the delay buffer.
+- **Big host blocks.** Live can occasionally send a bigger audio block than it said it would in `prepareToPlay`. `processBlock` cuts such blocks into pieces it was prepared for, so nothing ever has to allocate memory while playing.
 
 ---
 

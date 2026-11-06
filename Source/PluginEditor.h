@@ -196,6 +196,57 @@ private:
 };
 
 //==============================================================================
+// Mixer page: a channel strip per sound
+//==============================================================================
+class MixerPage : public juce::Component
+{
+public:
+    explicit MixerPage (RefractAudioProcessor& p);
+    void resized() override;
+    void paint (juce::Graphics&) override;
+private:
+    struct Strip
+    {
+        juce::Label name;
+        std::unique_ptr<Knob> level, pan, sendA, sendB;
+        std::unique_ptr<Choice> route;
+    };
+    std::array<Strip, refract::numMixSources + 1> strips;   // + the whole voice, after the filters
+    juce::Label returnsLabel;
+    std::unique_ptr<Knob> returnA, returnB, master;
+};
+
+//==============================================================================
+// FX page: two buses, three slots each
+//==============================================================================
+class FxSlotPanel : public juce::Component, private juce::Timer
+{
+public:
+    FxSlotPanel (RefractAudioProcessor& p, int bus, int slot);
+    void resized() override;
+    void paint (juce::Graphics&) override;
+private:
+    void timerCallback() override;   // relabels P1-P4 for the chosen effect
+    RefractAudioProcessor& processor;
+    const int bus, slot;
+    Choice type, mode;
+    Toggle sync;
+    Choice division;
+    Knob p1, p2, p3, p4, mix;
+    int shownType = -2, shownMode = -2, shownSync = -2;
+};
+
+class FxBusPanel : public Section
+{
+public:
+    FxBusPanel (RefractAudioProcessor& p, int bus);
+    void resized() override;
+private:
+    std::array<std::unique_ptr<FxSlotPanel>, refract::numFxSlots> slots;
+    Knob returnLevel;
+};
+
+//==============================================================================
 // Oscillator page
 //==============================================================================
 
@@ -310,13 +361,15 @@ private:
 
     // Bottom pages
     PresetBar presetBar;
-    std::array<juce::TextButton, 5> pageTabs;
-    juce::Component mainPage, oscPage, filterPage, modPage;
+    std::array<juce::TextButton, 7> pageTabs;
+    juce::Component mainPage, oscPage, filterPage, fxPage, modPage;
+    MixerPage mixerPage;
+    FxBusPanel busA, busB;
     ModMatrixPage matrixPage;
 
     // Main page
     Section ampEnv { "AMP ENVELOPE" }, voice { "VOICE" };
-    Section delay { "DELAY" }, reverb { "REVERB" }, macros { "MACROS" }, output { "OUTPUT" };
+    Section macros { "MACROS" }, output { "OUTPUT" };
 
     // Filter page
     Section filter1 { "FILTER 1", 2 }, filter2 { "FILTER 2", 2 }, filterRouting { "ROUTING" };
