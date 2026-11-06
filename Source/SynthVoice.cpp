@@ -15,8 +15,9 @@ namespace refract
         float semitonesToRatio (float semis) { return std::pow (2.0f, semis / 12.0f); }
     }
 
-    RefractVoice::RefractVoice (const ParamRefs& p, const PlaybackBank& b, const float& wheel)
-        : params (p), bank (b), modWheel (wheel) {}
+    RefractVoice::RefractVoice (int voiceIndex, const ParamRefs& p, const PlaybackBank& b,
+                                const float& wheel, PlayheadArray& heads)
+        : index (voiceIndex), params (p), bank (b), modWheel (wheel), playheads (heads) {}
 
     void RefractVoice::prepare (double sr, int maxBlockSize)
     {
@@ -30,24 +31,61 @@ namespace refract
         filterType = -1;
     }
 
+    // Converts the Start/End/Loop knobs (0..1 of the sample) into sample positions.
+    // Ableton-style rules: the loop always sits inside Start..End, and the
+    // crossfade borrows audio from *before* the loop start, so it can't be
+    // longer than the audio available there.
+    void RefractVoice::updateRegion (LayerState& ls, const ParamRefs::Layer& lp, bool setStart)
+    {
+        const double len = (double) ls.data->audio.getNumSamples();
+
+        double s = lp.start->load() * len, e = lp.end->load() * len;
+        if (e < s) std::swap (s, e);
+        if (e - s < 64.0) e = juce::jmin (len, s + 64.0);
+
+        double a = lp.loopStart->load() * len, b = lp.loopEnd->load() * len;
+        if (b < a) std::swap (a, b);
+        a = juce::jlimit (s, e, a);
+        b = juce::jlimit (s, e, b);
+
+        if (setStart)
+            ls.reversed = lp.reverse->load() > 0.5f;   // fixed for the whole note
+
+        if (ls.reversed)
+        {
+            // Reading the reversed copy: mirror every point, so "start" becomes len - end, etc.
+            const double ns = len - e, ne = len - s, na = len - b, nb = len - a;
+            s = ns; e = ne; a = na; b = nb;
+        }
+
+        ls.regionEnd = juce::jmin (e, len - 1.0);
+        ls.loopStart = a;
+        ls.loopEnd   = juce::jmin (b, len - 1.0);
+        ls.crossfade = juce::jlimit (0.0, a, (double) lp.crossfade->load() * (ls.loopEnd - ls.loopStart));
+        ls.loopMode  = (int) lp.loopMode->load();
+
+        if (setStart)
+        {
+            ls.position  = s;
+            ls.direction = 1;
+        }
+    }
+
     void RefractVoice::startNote (int midiNote, float vel, juce::SynthesiserSound*, int pitchWheel)
     {
         note = midiNote;
         velocity = vel;
+        keyReleased = false;
         pitchWheelMoved (pitchWheel);
 
         for (int i = 0; i < numLayers; ++i)
         {
             auto& ls = layers[(size_t) i];
             ls.data = bank.get (i);   // grab the current version of this layer's sample
-            ls.active = ls.data != nullptr && ls.data->audio.getNumSamples() > 1;
+            ls.active = ls.data != nullptr && ls.data->audio.getNumSamples() > 128;
             ls.gainL = ls.gainR = ls.stepL = ls.stepR = 0.0f;
             if (ls.active)
-            {
-                const auto len = (double) ls.data->audio.getNumSamples();
-                ls.position  = juce::jlimit (0.0, len - 1.0, (double) params.layers[(size_t) i].start->load() * len);
-                ls.loopStart = ls.position;
-            }
+                updateRegion (ls, params.layers[(size_t) i], true);
         }
 
         subPhase = 0.0;
@@ -75,6 +113,7 @@ namespace refract
 
     void RefractVoice::stopNote (float, bool allowTailOff)
     {
+        keyReleased = true;
         if (allowTailOff)
         {
             ampEnv.noteOff();   // let the release stage play out
@@ -100,6 +139,22 @@ namespace refract
         {
             ls.active = false;
             ls.data.reset();   // safe on the audio thread: the processor always holds another reference
+        }
+        publishPlayheads();
+    }
+
+    void RefractVoice::publishPlayheads()
+    {
+        for (int i = 0; i < numLayers; ++i)
+        {
+            const auto& ls = layers[(size_t) i];
+            float v = -1.0f;
+            if (ls.active && ls.data != nullptr)
+            {
+                v = (float) (ls.position / (double) ls.data->audio.getNumSamples());
+                if (ls.reversed) v = 1.0f - v;   // show it on the forwards waveform
+            }
+            playheads[(size_t) i][(size_t) index].store (v, std::memory_order_relaxed);
         }
     }
 
@@ -144,17 +199,19 @@ namespace refract
             float targetL = 0.0f, targetR = 0.0f;
             if (ls.active)
             {
+                updateRegion (ls, lp, false);   // loop points can move while the note plays
+
                 const float level = lp.on->load() > 0.5f
                                   ? juce::jlimit (0.0f, 1.0f, lp.level->load() + dst[dstLayer1 + i]) : 0.0f;
                 panGains (lp.pan->load() + panMod, targetL, targetR);
                 targetL *= level;
                 targetR *= level;
 
-                // Notes are relative to middle C (MIDI 60). Coarse/fine shift that.
-                const float semis = (float) (note - 60) + lp.coarse->load() + lp.fine->load() * 0.01f
-                                  + pitchBend + pitchMod;
+                // The root note plays the sample at its original pitch; every
+                // semitone away from it speeds up or slows down playback.
+                const float semis = (float) (note - (int) lp.root->load()) + lp.coarse->load()
+                                  + lp.fine->load() * 0.01f + pitchBend + pitchMod;
                 ls.increment = ls.data->sampleRate / sampleRate * (double) semitonesToRatio (semis);
-                ls.loop = lp.loop->load() > 0.5f;
             }
             ls.stepL = (targetL - ls.gainL) / (float) n;
             ls.stepR = (targetR - ls.gainR) / (float) n;
@@ -190,10 +247,10 @@ namespace refract
 
     // 4-point cubic (Hermite) interpolation: reading "between" samples smoothly is
     // what lets us repitch a sample without the grainy sound of simple rounding.
-    float RefractVoice::readSample (const SampleData& data, int channel, double position) const
+    float RefractVoice::readSample (const juce::AudioBuffer<float>& buffer, int channel, double position)
     {
-        const int   len = data.audio.getNumSamples();
-        const float* s  = data.audio.getReadPointer (juce::jmin (channel, data.audio.getNumChannels() - 1));
+        const int   len = buffer.getNumSamples();
+        const float* s  = buffer.getReadPointer (juce::jmin (channel, buffer.getNumChannels() - 1));
         const int   i1  = (int) position;
         const float t   = (float) (position - (double) i1);
 
@@ -212,6 +269,7 @@ namespace refract
             return;
 
         const int outChannels = output.getNumChannels();
+        constexpr float halfPi = juce::MathConstants<float>::halfPi;
 
         while (numSamples > 0)
         {
@@ -222,7 +280,7 @@ namespace refract
             {
                 float left = 0.0f, right = 0.0f;
 
-                // Sample layers
+                // --- Sample layers ---
                 for (auto& ls : layers)
                 {
                     ls.gainL += ls.stepL;
@@ -230,23 +288,59 @@ namespace refract
                     if (! ls.active)
                         continue;
 
-                    const auto& d = *ls.data;
-                    left  += readSample (d, 0, ls.position) * ls.gainL;
-                    right += readSample (d, 1, ls.position) * ls.gainR;   // mono files reuse channel 0
+                    const auto& buf = ls.reversed ? ls.data->reversed : ls.data->audio;
+                    const double loopLen = ls.loopEnd - ls.loopStart;
+                    const bool looping = ls.loopMode != loopOff && loopLen >= 64.0
+                                      && ! (ls.loopMode == loopRelease && keyReleased);
+                    const double p = ls.position;
 
-                    ls.position += ls.increment;
-                    const double len = (double) d.audio.getNumSamples();
-                    if (ls.position >= len - 1.0)
+                    float l = readSample (buf, 0, p);
+                    float r = readSample (buf, 1, p);   // mono files reuse channel 0
+
+                    // Loop crossfade: as we approach the loop end, fade in the audio
+                    // from just before the loop start. When we jump back, the two
+                    // match exactly - no click.
+                    if (looping && ls.loopMode != loopPingPong && ls.crossfade >= 1.0
+                        && p >= ls.loopEnd - ls.crossfade && p < ls.loopEnd)
                     {
-                        const double loopLen = len - 1.0 - ls.loopStart;
-                        if (ls.loop && loopLen > 16.0)
-                            ls.position = ls.loopStart + std::fmod (ls.position - ls.loopStart, loopLen);
-                        else
-                            ls.active = false;   // one-shot finished
+                        const float t = (float) ((p - (ls.loopEnd - ls.crossfade)) / ls.crossfade);
+                        const float fadeOut = std::cos (t * halfPi), fadeIn = std::sin (t * halfPi);
+                        const double p2 = p - loopLen;
+                        l = l * fadeOut + readSample (buf, 0, p2) * fadeIn;
+                        r = r * fadeOut + readSample (buf, 1, p2) * fadeIn;
                     }
+
+                    left  += l * ls.gainL;
+                    right += r * ls.gainR;
+
+                    // Move the read position, handling loops
+                    ls.position += ls.increment * (double) ls.direction;
+                    if (looping)
+                    {
+                        if (ls.loopMode == loopPingPong)
+                        {
+                            if (ls.direction > 0 && ls.position >= ls.loopEnd && p < ls.loopEnd)
+                            {
+                                ls.position = juce::jmax (ls.loopStart, 2.0 * ls.loopEnd - ls.position);
+                                ls.direction = -1;
+                            }
+                            else if (ls.direction < 0 && ls.position <= ls.loopStart)
+                            {
+                                ls.position = juce::jmin (ls.loopEnd, 2.0 * ls.loopStart - ls.position);
+                                ls.direction = 1;
+                            }
+                        }
+                        else if (ls.position >= ls.loopEnd && p < ls.loopEnd)
+                        {
+                            ls.position = ls.loopStart + std::fmod (ls.position - ls.loopStart, loopLen);
+                        }
+                    }
+
+                    if ((ls.direction > 0 && ls.position >= ls.regionEnd) || ls.position < 0.0)
+                        ls.active = false;   // reached the end marker
                 }
 
-                // Sub oscillator
+                // --- Sub oscillator ---
                 subGain += subStep;
                 if (subGain > 0.0001f)
                 {
@@ -261,7 +355,7 @@ namespace refract
                 subPhase += subIncrement;
                 if (subPhase >= 1.0) subPhase -= 1.0;
 
-                // Filter, then the amp envelope
+                // --- Filter, then the amp envelope ---
                 left  = filter.processSample (0, left);
                 right = filter.processSample (1, right);
 
@@ -289,5 +383,7 @@ namespace refract
             startSample += n;
             numSamples  -= n;
         }
+
+        publishPlayheads();
     }
 }

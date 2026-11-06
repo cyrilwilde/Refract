@@ -18,7 +18,7 @@ namespace refract
     // The spectral mask is a fixed grid, independent of sample length:
     // maskWidth cells across time, maskHeight cells across frequency.
     // Frequency rows are log-spaced (like a piano), 20 Hz at row 0, 20 kHz at the top.
-    constexpr int   maskWidth   = 512;
+    constexpr int   maskWidth   = 1024;
     constexpr int   maskHeight  = 256;
     constexpr float minMaskFreq = 20.0f;
     constexpr float maxMaskFreq = 20000.0f;
@@ -32,6 +32,10 @@ namespace refract
         if (f <= minMaskFreq) return 0.0f;
         return juce::jlimit (0.0f, 1.0f, std::log (f / minMaskFreq) / std::log (maxMaskFreq / minMaskFreq));
     }
+
+    // How a layer's loop behaves (same idea as Ableton's Sampler)
+    enum LoopMode { loopOff = 0, loopForward, loopPingPong, loopRelease };
+    inline juce::StringArray loopModeNames() { return { "Off", "Forward", "Ping-Pong", "Fwd + Release" }; }
 
     // Modulation sources and destinations. The order must match the name lists below.
     enum ModSource { srcNone = 0, srcModEnv, srcLfo1, srcLfo2, srcVelocity, srcModWheel, srcKeyTrack, numModSources };
@@ -61,7 +65,14 @@ namespace refract
     {
         using P = std::atomic<float>*;
 
-        struct Layer  { P on, level, coarse, fine, pan, start, loop; };
+        struct Layer
+        {
+            P on, level, pan;
+            P root, coarse, fine;                       // tuning
+            P start, end;                               // playback region (0..1 of the sample)
+            P loopMode, loopStart, loopEnd, crossfade;  // loop region (0..1) and crossfade (0..0.5 of loop)
+            P reverse;
+        };
         struct Env    { P attack, decay, sustain, release; };
         struct Lfo    { P rate, shape; };
         struct Slot   { P source, dest, amount; };

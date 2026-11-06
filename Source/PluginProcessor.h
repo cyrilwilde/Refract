@@ -61,8 +61,17 @@ public:
         bool missing = false;    // file saved in the set can't be found any more
         bool busy = false;       // loading or rendering in the background
         juce::Image spectrogram;
+        refract::SampleDataPtr playback;        // the audio you actually hear (after painting)
+        refract::WaveformPeaksPtr peaks;        // zoomed-out overview of it
     };
     LayerDisplayInfo getDisplayInfo (int layer) const;
+
+    // Where each voice currently is in a layer's sample (0..1, or -1 if silent)
+    float getPlayhead (int layer, int voice) const { return playheads[(size_t) layer][(size_t) voice].load (std::memory_order_relaxed); }
+
+    // Estimates the pitch of a layer's sample as a (fractional) MIDI note,
+    // or returns -1 if no clear pitch was found.
+    float detectPitch (int layer) const;
 
     juce::AudioProcessorValueTreeState apvts;
     juce::AudioFormatManager formatManager;
@@ -76,6 +85,7 @@ private:
 
         // Written by background jobs, read by the UI - guarded by dataLock:
         refract::SampleDataPtr original;
+        refract::WaveformPeaksPtr peaks;
         juce::Image spectrogram;
         bool missing = false;
 
@@ -87,13 +97,14 @@ private:
     };
 
     void startJob (int layer, bool reloadFile);
-    void publish (int layer, int renderGeneration, refract::SampleDataPtr playback);
+    void publish (int layer, int renderGeneration, refract::SampleDataPtr playback, refract::WaveformPeaksPtr peaks);
     refract::SampleDataPtr readAudioFile (const juce::File& file);
     void timerCallback() override;   // frees replaced samples, off the audio thread
     void processDelay (juce::AudioBuffer<float>& buffer);
 
     refract::ParamRefs params;
     refract::PlaybackBank bank;
+    refract::PlayheadArray playheads;
     refract::RefractSynth synth;
     std::array<LayerSlot, refract::numLayers> layers;
 

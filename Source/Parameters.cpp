@@ -25,6 +25,7 @@ namespace refract
         {
             if (unit == "s")  return v < 1.0f ? juce::String (v * 1000.0f, 0) + " ms" : juce::String (v, 2) + " s";
             if (unit == "Hz") return v >= 1000.0f ? juce::String (v / 1000.0f, 2) + " kHz" : juce::String (v, v < 10.0f ? 2 : 0) + " Hz";
+            if (unit == "%")  return juce::String (v * 100.0f, 1) + " %";
             const int decimals = span >= 100.0f ? 0 : (span >= 10.0f ? 1 : 2);
             return juce::String (v, decimals) + (unit.isEmpty() ? juce::String() : " " + unit);
         }
@@ -34,7 +35,26 @@ namespace refract
             const float v = text.getFloatValue();
             if (unit == "s"  && text.containsIgnoreCase ("ms")) return v * 0.001f;
             if (unit == "Hz" && text.containsIgnoreCase ("k"))  return v * 1000.0f;
+            if (unit == "%")                                     return v * 0.01f;
             return v;
+        }
+
+        // "C3", "F#2", "Bb4" or a plain MIDI number -> MIDI note number (C3 = 60)
+        int parseNoteName (const juce::String& text)
+        {
+            const auto t = text.trim().toUpperCase();
+            if (t.isEmpty()) return 60;
+            if (t.containsOnly ("0123456789")) return juce::jlimit (0, 127, t.getIntValue());
+
+            const int semis[] = { 9, 11, 0, 2, 4, 5, 7 };   // A B C D E F G
+            const auto letter = t[0];
+            if (letter < 'A' || letter > 'G') return 60;
+            int note = semis[letter - 'A'];
+            int i = 1;
+            if (t[i] == '#') { ++note; ++i; }
+            else if (t[i] == 'B' && t.length() > 2) { --note; ++i; }
+            const int octave = t.substring (i).getIntValue();   // handles "-1"
+            return juce::jlimit (0, 127, (octave + 2) * 12 + note);
         }
 
         void addFloat (Layout& l, const juce::String& id, const juce::String& name,
@@ -73,11 +93,26 @@ namespace refract
             const auto n = "Layer " + juce::String (i + 1) + " ";
             l.add (std::make_unique<juce::AudioParameterBool> (pid (ids::layer (i, "on")), n + "On", true));
             addFloat (l, ids::layer (i, "level"),  n + "Level",  { 0.0f, 1.0f }, 0.8f);
-            l.add (std::make_unique<juce::AudioParameterInt> (pid (ids::layer (i, "coarse")), n + "Coarse", -24, 24, 0));
-            addFloat (l, ids::layer (i, "fine"),   n + "Fine",   { -100.0f, 100.0f, 1.0f }, 0.0f, "ct");
             addFloat (l, ids::layer (i, "pan"),    n + "Pan",    { -1.0f, 1.0f }, 0.0f);
-            addFloat (l, ids::layer (i, "start"),  n + "Start",  { 0.0f, 1.0f }, 0.0f);
-            l.add (std::make_unique<juce::AudioParameterBool> (pid (ids::layer (i, "loop")), n + "Loop", false));
+
+            // Tuning: the root note is the key at which the sample plays at its
+            // original pitch. Shown as a note name ("C3" = MIDI 60, Ableton style).
+            l.add (std::make_unique<juce::AudioParameterInt> (pid (ids::layer (i, "root")), n + "Root Note", 0, 127, 60,
+                       juce::AudioParameterIntAttributes()
+                           .withStringFromValueFunction ([] (int v, int) { return juce::MidiMessage::getMidiNoteName (v, true, true, 3); })
+                           .withValueFromStringFunction ([] (const juce::String& t) { return parseNoteName (t); })));
+            l.add (std::make_unique<juce::AudioParameterInt> (pid (ids::layer (i, "coarse")), n + "Transpose", -48, 48, 0,
+                       juce::AudioParameterIntAttributes().withLabel ("st")));
+            addFloat (l, ids::layer (i, "fine"),   n + "Fine",   { -100.0f, 100.0f, 0.1f }, 0.0f, "ct");
+
+            // Playback region and loop, as fractions of the sample length
+            addFloat  (l, ids::layer (i, "start"),     n + "Sample Start", { 0.0f, 1.0f }, 0.0f, "%");
+            addFloat  (l, ids::layer (i, "end"),       n + "Sample End",   { 0.0f, 1.0f }, 1.0f, "%");
+            addChoice (l, ids::layer (i, "loopmode"),  n + "Loop Mode",    loopModeNames(), loopOff);
+            addFloat  (l, ids::layer (i, "loopstart"), n + "Loop Start",   { 0.0f, 1.0f }, 0.0f, "%");
+            addFloat  (l, ids::layer (i, "loopend"),   n + "Loop End",     { 0.0f, 1.0f }, 1.0f, "%");
+            addFloat  (l, ids::layer (i, "xfade"),     n + "Loop Crossfade", { 0.0f, 0.5f }, 0.0f, "%");
+            l.add (std::make_unique<juce::AudioParameterBool> (pid (ids::layer (i, "reverse")), n + "Reverse", false));
         }
 
         // --- Sub oscillator -----------------------------------------------
@@ -138,10 +173,22 @@ namespace refract
         };
 
         for (int i = 0; i < numLayers; ++i)
-            layers[(size_t) i] = { get (ids::layer (i, "on")),   get (ids::layer (i, "level")),
-                                   get (ids::layer (i, "coarse")), get (ids::layer (i, "fine")),
-                                   get (ids::layer (i, "pan")),  get (ids::layer (i, "start")),
-                                   get (ids::layer (i, "loop")) };
+        {
+            auto& L = layers[(size_t) i];
+            L.on        = get (ids::layer (i, "on"));
+            L.level     = get (ids::layer (i, "level"));
+            L.pan       = get (ids::layer (i, "pan"));
+            L.root      = get (ids::layer (i, "root"));
+            L.coarse    = get (ids::layer (i, "coarse"));
+            L.fine      = get (ids::layer (i, "fine"));
+            L.start     = get (ids::layer (i, "start"));
+            L.end       = get (ids::layer (i, "end"));
+            L.loopMode  = get (ids::layer (i, "loopmode"));
+            L.loopStart = get (ids::layer (i, "loopstart"));
+            L.loopEnd   = get (ids::layer (i, "loopend"));
+            L.crossfade = get (ids::layer (i, "xfade"));
+            L.reverse   = get (ids::layer (i, "reverse"));
+        }
 
         subLevel  = get ("sub_level");
         subOctave = get ("sub_octave");

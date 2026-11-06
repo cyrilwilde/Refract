@@ -100,15 +100,31 @@ To work on the code in Xcode instead of Terminal, open `build/Refract.xcodeproj`
 ## Part 2: Using it
 
 1. Pick a layer tab (**Layer 1 / 2 / 3**) at the top right.
-2. **Load a sample.** Drag an audio file (WAV, AIFF, FLAC, MP3, Ogg) onto the dark area, or click **Load**. Middle C (C3 in Live) plays the sample at its original pitch.
-3. **Paint.** Drag on the spectrogram to remove frequencies.
+2. **Load a sample.** Drag an audio file (WAV, AIFF, FLAC, MP3, Ogg) onto the sample view, or click **Load**.
+3. **The sample view** works like Ableton's Sampler:
+   - **Wave / Spectral** switches between the waveform and the paintable spectrogram. A white line moves across for every note that's playing.
+   - **Zoom** by scrolling up/down or pinching on the trackpad. Scroll sideways to move along the sample. Double-click the ruler (the strip along the top), or click **Fit**, to see the whole sample again.
+   - **Start / End:** drag the **S** and **E** flags in the top half of the ruler. In the Wave view you can also grab the white lines themselves. Anything outside them is dimmed and won't play.
+   - **Loop:** pick a **Loop** mode, then drag the loop bar in the bottom half of the ruler. Drag its edges to set Loop Start / End, or drag the middle to move the whole loop.
+     - *Forward* loops while the note is held.
+     - *Ping-Pong* plays back and forth.
+     - *Fwd + Release* loops while you hold the key, then plays on to the End marker when you let go (great for sounds with a tail).
+   - **X-Fade** blends the end of the loop into the audio just before the loop start, so loops don't click. The diagonal line shows where it happens. Crossfade needs audio *before* the loop start, so it can't be longer than the gap between Start of sample and Loop Start.
+   - **Snap** makes markers jump to the nearest zero crossing, where cuts are click-free.
+   - **Reverse** plays the region backwards (the markers keep their places on the forwards waveform).
+4. **Tuning.**
+   - **Root** is the key at which the sample plays at its original pitch. Set it to the note the sample was recorded at.
+   - **Detect** works this out for you: it finds the sample's pitch and sets Root and Fine so the sample plays in tune across the keyboard.
+   - **Transpose** shifts by semitones (±4 octaves), and **Fine** by cents.
+   - All three can be typed in: double-click the value under the dial. Root accepts note names like `F#2`.
+5. **Paint** (in the Spectral view). Drag on the spectrogram to remove frequencies.
    - Time runs left to right and pitch runs bottom (low) to top (high).
    - **Remove / Restore** chooses what the brush does. A right-drag always does the opposite of the current mode.
    - **Brush** paints with a soft round brush. **Rectangle** drags out a box that clears a whole region (e.g. "everything above 5 kHz for the first second").
    - **Size** sets the brush radius. **Strength** sets how far it cuts: 1.0 removes fully, 0.3 gently turns things down.
    - **Reset Paint** undoes all painting on the layer. **Invert** swaps kept and removed, which turns "remove this noise" into "keep *only* this noise".
-   - When you let go of the mouse, "Rendering..." appears for a moment while the sample is rebuilt. Notes you're already holding finish with the old version, and new notes use the new one.
-4. Shape the sound with the sub oscillator, envelopes, filter, LFOs, mod matrix and effects.
+   - When you let go of the mouse, "Rendering..." appears for a moment while the sample is rebuilt. The waveform view updates to show the edited sound.
+6. Shape the sound with the sub oscillator, envelopes, filter, LFOs, mod matrix and effects.
 
 **Mod matrix tips.** Slots 1-3 come pre-routed with their amount set to 0, so you only need to turn an amount up:
 
@@ -255,6 +271,23 @@ JUCE's `Synthesiser` class handles MIDI: it finds a free voice for each note-on 
 - **`Section`** is a titled panel that lays its children out in a row.
 - **`SpectralEditor`** converts mouse positions into mask cells (`toMask`), stamps a soft round brush (a raised-cosine falloff, so edits fade at the edges instead of having hard cut-offs), and fills the gaps between mouse events so fast strokes don't leave dotted lines. It only *writes the mask*. When you release the mouse it asks the processor to re-render, and the processor tells the UI (via `ChangeBroadcaster`) when the new picture or render is ready.
 - **`RefractLookAndFeel`** holds the colours and the custom knob drawing. Bipolar knobs (pan, fine, mod amount) draw their arc from the centre.
+
+### 3.10 Stage 1 additions: sampler view, loops and tuning
+
+- **Playheads.** Each voice writes "where am I in each layer, 0..1" into a small table of atomic numbers (`PlayheadArray`) at the end of every audio block. The sample view reads that table 30 times a second and draws the lines. Atomics are safe to share between threads without locks, so the audio thread never waits for the UI.
+- **Markers are just parameters.** Start, End, Loop Start, Loop End and X-Fade are ordinary automatable parameters, stored as 0..1 of the sample length so they still make sense if you swap in a different sample. Dragging a flag calls `setValueNotifyingHost`, the same as turning a dial. That's why you can automate loop points in Live.
+- **How a loop plays** (`RefractVoice::renderNextBlock`):
+  - In *Forward* mode, when the read position passes Loop End it jumps back by exactly one loop length.
+  - In *Ping-Pong* mode it flips direction instead.
+  - *Fwd + Release* is Forward until the note-off arrives (`keyReleased`), after which wrapping stops and the sound plays through to the End marker.
+- **Crossfade.** As the read position enters the last stretch before Loop End, the voice reads a second point exactly one loop length earlier (i.e. just before Loop Start). It fades from the first to the second with an equal-power curve (cos/sin). By the time it reaches Loop End it's playing only the second point, which is precisely where the jump lands, so the join is seamless.
+- **Reverse** uses a reversed copy of the sample made in the background (`makeSampleData`). Every marker is mirrored (`len - position`) and then exactly the same forward-playing code runs. That's much simpler than writing all the loop logic twice.
+- **Zoom.** The view keeps a visible range (`viewStart`..`viewEnd`, 0..1). Every pixel↔sample conversion goes through `xToNorm`/`normToX`, so zooming changes only those two numbers.
+  - The waveform uses pre-computed min/max blocks (`WaveformPeaks`) when zoomed out, and the real samples when zoomed in. That way drawing costs about the same at any zoom level.
+- **Pitch detection** uses the YIN method (`detectPitch`).
+  - It takes a chunk of the sample and compares it with copies of itself delayed by 1, 2, 3... samples. When the delay equals one cycle of the waveform, the copy lines up and the difference dips.
+  - The first clear dip gives the period, and `frequency = sampleRate / period`.
+  - Converting to a note: `69 + 12 × log2(frequency / 440)`. The whole-number part becomes Root, and the leftover becomes Fine.
 
 ---
 

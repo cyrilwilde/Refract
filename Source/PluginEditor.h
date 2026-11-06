@@ -98,7 +98,8 @@ private:
 };
 
 //==============================================================================
-// Everything for one sample layer: spectrogram, painting tools, layer knobs.
+// Everything for one sample layer: the sample view, painting tools, and the
+// layer's tuning / region / loop controls.
 //==============================================================================
 class LayerPanel : public juce::Component
 {
@@ -109,22 +110,38 @@ public:
     void paint (juce::Graphics&) override;
 
 private:
+    void setView (SpectralEditor::View v);
+    void detectPitch();
+    void setParameter (const juce::String& id, float value);
+
     RefractAudioProcessor& processor;
     const int layer;
 
     SpectralEditor spectral;
 
+    // Toolbar
     juce::TextButton loadButton { "Load" }, clearButton { "Clear" };
-    juce::TextButton resetMaskButton { "Reset Paint" }, invertMaskButton { "Invert" };
+    juce::TextButton waveButton { "Wave" }, spectralButton { "Spectral" }, fitButton { "Fit" };
+    juce::ToggleButton snapButton { "Snap" };
     juce::Label fileLabel;
+    juce::String detectedText;
+
+    // Painting tools (only shown in the spectral view)
+    juce::TextButton resetMaskButton { "Reset Paint" }, invertMaskButton { "Invert" };
     juce::ComboBox toolBox, modeBox;
     juce::Slider sizeSlider { juce::Slider::LinearHorizontal, juce::Slider::NoTextBox };
     juce::Slider strengthSlider { juce::Slider::LinearHorizontal, juce::Slider::NoTextBox };
-    juce::Label sizeLabel, strengthLabel, hintLabel;
+    juce::Label sizeLabel, strengthLabel;
 
+    // Layer controls
     Toggle on;
-    Knob level, coarse, fine, pan, start;
-    Toggle loop;
+    Knob level, pan;
+    Knob root, transpose, fine;
+    juce::TextButton detectButton { "Detect" };
+    Knob start, end;
+    Choice loopMode;
+    Knob loopStart, loopEnd, crossfade;
+    Toggle reverse;
 
     std::unique_ptr<juce::FileChooser> chooser;
 };
@@ -153,6 +170,8 @@ private:
     Section sub { "SUB" }, ampEnv { "AMP ENVELOPE" }, modEnv { "MOD ENVELOPE" }, filter { "FILTER" };
     Section lfo1 { "LFO 1" }, lfo2 { "LFO 2" }, delay { "DELAY" }, reverb { "REVERB" }, output { "OUTPUT" };
     ModMatrixSection matrix;
+
+    juce::TooltipWindow tooltips { this, 600 };   // shows the hover hints on buttons
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (RefractAudioProcessorEditor)
 };

@@ -72,7 +72,8 @@ namespace refract
     class RefractVoice : public juce::SynthesiserVoice
     {
     public:
-        RefractVoice (const ParamRefs& params, const PlaybackBank& bank, const float& modWheel);
+        RefractVoice (int voiceIndex, const ParamRefs& params, const PlaybackBank& bank,
+                      const float& modWheel, PlayheadArray& playheads);
 
         void prepare (double sampleRate, int maxBlockSize);
 
@@ -90,27 +91,36 @@ namespace refract
         // ("control rate") rather than every sample - much cheaper, inaudible.
         static constexpr int controlBlockSize = 32;
 
-        void updateControl (int numSamples);
-        void finishNote();
-        float readSample (const SampleData& data, int channel, double position) const;
-
-        const ParamRefs& params;
-        const PlaybackBank& bank;
-        const float& modWheel;
-
-        double sampleRate = 44100.0;
-
         struct LayerState
         {
             SampleDataPtr data;           // keeps the sample alive while this note plays
             bool   active = false;
+            bool   reversed = false;      // reading the reversed copy of the sample
             double position = 0.0;        // read position in samples (fractional)
             double increment = 0.0;       // how far to move per output sample
-            double loopStart = 0.0;
-            bool   loop = false;
+            int    direction = 1;         // +1 forwards, -1 backwards (ping-pong)
+
+            // Region in the buffer being read (already mirrored when reversed)
+            double regionEnd = 0.0, loopStart = 0.0, loopEnd = 0.0, crossfade = 0.0;
+            int    loopMode = loopOff;
+
             float  gainL = 0.0f, gainR = 0.0f;       // current (ramped) gains
             float  stepL = 0.0f, stepR = 0.0f;       // per-sample ramp toward the target
         };
+
+        void updateControl (int numSamples);
+        void updateRegion (LayerState& ls, const ParamRefs::Layer& lp, bool setStart);
+        void finishNote();
+        void publishPlayheads();
+        static float readSample (const juce::AudioBuffer<float>& buffer, int channel, double position);
+
+        const int index;
+        const ParamRefs& params;
+        const PlaybackBank& bank;
+        const float& modWheel;
+        PlayheadArray& playheads;
+
+        double sampleRate = 44100.0;
         std::array<LayerState, numLayers> layers;
 
         double subPhase = 0.0, subIncrement = 0.0;
@@ -127,5 +137,6 @@ namespace refract
         float pitchBend = 0.0f;           // semitones
         float modEnvValue = 0.0f;
         float ampGain = 1.0f;
+        bool  keyReleased = false;        // note-off received (for "Fwd + Release" loops)
     };
 }

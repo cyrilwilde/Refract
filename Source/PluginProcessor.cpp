@@ -50,9 +50,13 @@ RefractAudioProcessor::RefractAudioProcessor()
 {
     formatManager.registerBasicFormats();   // WAV, AIFF, FLAC, Ogg, MP3 (on macOS)
 
+    for (auto& layerHeads : playheads)
+        for (auto& h : layerHeads)
+            h.store (-1.0f);
+
     synth.addSound (new RefractSound());
     for (int i = 0; i < numVoices; ++i)
-        synth.addVoice (new RefractVoice (params, bank, synth.modWheel));
+        synth.addVoice (new RefractVoice (i, params, bank, synth.modWheel, playheads));
 
     startTimerHz (2);
 }
@@ -171,7 +175,7 @@ void RefractAudioProcessor::clearSample (int layer)
         slot.spectrogram = juce::Image();
         slot.missing = false;
     }
-    publish (layer, gen, nullptr);
+    publish (layer, gen, nullptr, nullptr);
     sendChangeMessage();
 }
 
@@ -192,11 +196,97 @@ refract::SampleDataPtr RefractAudioProcessor::readAudioFile (const juce::File& f
     if (length <= 0 || channels <= 0)
         return nullptr;
 
-    auto data = std::make_shared<SampleData>();
-    data->sampleRate = reader->sampleRate;
-    data->audio.setSize (channels, length);
-    reader->read (&data->audio, 0, length, 0, true, channels > 1);
-    return data;
+    juce::AudioBuffer<float> audio (channels, length);
+    reader->read (&audio, 0, length, 0, true, channels > 1);
+    return makeSampleData (std::move (audio), reader->sampleRate);
+}
+
+// Pitch detection using the YIN method: compare the sound with delayed copies
+// of itself; the delay where it matches best is one cycle of the waveform.
+float RefractAudioProcessor::detectPitch (int layer) const
+{
+    SampleDataPtr data;
+    {
+        const juce::ScopedLock sl (dataLock);
+        data = layers[(size_t) layer].original;
+    }
+    if (data == nullptr)
+        return -1.0f;
+
+    const auto& audio = data->audio;
+    const double sr = data->sampleRate;
+    const int len = audio.getNumSamples();
+    const int tauMin = juce::jmax (2, (int) (sr / 2000.0));   // up to ~2 kHz
+    const int tauMax = (int) (sr / 40.0);                    // down to 40 Hz
+    const int window = tauMax * 2;
+    const int segment = window + tauMax + 2;
+    if (len < segment)
+        return -1.0f;
+
+    // Use the loudest of a few candidate spots (skips silence and sharp attacks)
+    int bestStart = 0;
+    float bestRms = 0.0f;
+    for (float frac : { 0.1f, 0.25f, 0.4f, 0.55f })
+    {
+        const int s = juce::jmin ((int) (frac * (float) len), len - segment);
+        float sum = 0.0f;
+        for (int ch = 0; ch < audio.getNumChannels(); ++ch)
+            sum += audio.getRMSLevel (ch, s, segment);
+        if (sum > bestRms) { bestRms = sum; bestStart = s; }
+    }
+    if (bestRms < 1.0e-4f)
+        return -1.0f;
+
+    std::vector<float> x ((size_t) segment);
+    for (int i = 0; i < segment; ++i)
+    {
+        float v = 0.0f;
+        for (int ch = 0; ch < audio.getNumChannels(); ++ch)
+            v += audio.getSample (ch, bestStart + i);
+        x[(size_t) i] = v;
+    }
+
+    // Difference function, then "cumulative mean normalised difference"
+    std::vector<float> d ((size_t) tauMax + 2, 1.0f);
+    float runningSum = 0.0f;
+    for (int tau = 1; tau <= tauMax + 1; ++tau)
+    {
+        float sum = 0.0f;
+        for (int j = 0; j < window; ++j)
+        {
+            const float diff = x[(size_t) j] - x[(size_t) (j + tau)];
+            sum += diff * diff;
+        }
+        runningSum += sum;
+        d[(size_t) tau] = runningSum > 0.0f ? sum * (float) tau / runningSum : 1.0f;
+    }
+
+    // First dip below the threshold, then walk to the bottom of that dip
+    int tau = -1;
+    for (int t = tauMin; t <= tauMax; ++t)
+        if (d[(size_t) t] < 0.15f)
+        {
+            while (t + 1 <= tauMax && d[(size_t) (t + 1)] < d[(size_t) t]) ++t;
+            tau = t;
+            break;
+        }
+    if (tau < 0)
+    {
+        // No confident dip: use the deepest one, but only if it's reasonably clear
+        tau = tauMin;
+        for (int t = tauMin; t <= tauMax; ++t)
+            if (d[(size_t) t] < d[(size_t) tau]) tau = t;
+        if (d[(size_t) tau] > 0.4f)
+            return -1.0f;
+    }
+
+    // Parabolic interpolation for sub-sample accuracy
+    const float a = d[(size_t) (tau - 1)], b = d[(size_t) tau], c = d[(size_t) (tau + 1)];
+    const float denom = a - 2.0f * b + c;
+    const float exactTau = (float) tau + (std::abs (denom) > 1.0e-9f ? 0.5f * (a - c) / denom : 0.0f);
+
+    const double freq = sr / (double) exactTau;
+    return (float) (69.0 + 12.0 * std::log2 (freq / 440.0));
 }
 
 void RefractAudioProcessor::startJob (int layer, bool reloadFile)
@@ -261,28 +351,30 @@ void RefractAudioProcessor::startJob (int layer, bool reloadFile)
                 }
                 else
                 {
-                    auto data = std::make_shared<SampleData>();
-                    data->audio = std::move (edited);
-                    data->sampleRate = original->sampleRate;
-                    playback = data;
+                    playback = makeSampleData (std::move (edited), original->sampleRate);
                 }
             }
         }
 
-        // Step 3: hand the result to the audio thread.
+        // Step 3: hand the result to the audio thread (and its overview to the UI).
         if (! aborted)
-            publish (layer, renderGen, playback);
+            publish (layer, renderGen, playback, playback != nullptr ? makePeaks (playback->audio) : nullptr);
 
         --s.pendingJobs;
         sendChangeMessage();   // safe from any thread - the UI is updated later on the message thread
     });
 }
 
-void RefractAudioProcessor::publish (int layer, int renderGen, SampleDataPtr playback)
+void RefractAudioProcessor::publish (int layer, int renderGen, SampleDataPtr playback, WaveformPeaksPtr peaks)
 {
     const juce::ScopedLock sl (publishLock);
     if (renderGen != layers[(size_t) layer].renderGeneration.load())
         return;   // a newer edit is on its way; don't overwrite it with this older one
+
+    {
+        const juce::ScopedLock dl (dataLock);
+        layers[(size_t) layer].peaks = std::move (peaks);
+    }
 
     // Swap in the new sample. Voices already playing keep the old one until
     // their note ends; we park it in the graveyard rather than free it here.
@@ -311,6 +403,8 @@ RefractAudioProcessor::LayerDisplayInfo RefractAudioProcessor::getDisplayInfo (i
     const juce::ScopedLock sl (dataLock);
     info.missing = slot.missing;
     info.spectrogram = slot.spectrogram;
+    info.peaks = slot.peaks;
+    info.playback = bank.get (layer);
     if (slot.original != nullptr)
         info.lengthSeconds = slot.original->audio.getNumSamples() / slot.original->sampleRate;
     return info;

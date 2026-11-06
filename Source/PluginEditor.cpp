@@ -72,7 +72,7 @@ void Section::paint (juce::Graphics& g)
     g.setColour (colours::panelEdge);
     g.drawRoundedRectangle (r, 8.0f, 1.0f);
 
-    g.setColour (colours::accent.withAlpha (0.85f));
+    g.setColour (colours::dimText);
     g.setFont (juce::Font (juce::FontOptions (11.0f, juce::Font::bold)));
     g.drawText (title, getLocalBounds().reduced (10, 6).removeFromTop (14), juce::Justification::left);
 }
@@ -100,7 +100,6 @@ ModMatrixSection::ModMatrixSection (APVTS& state) : Section ("MOD MATRIX")
         row.amountAttachment = std::make_unique<APVTS::SliderAttachment>   (state, ids::mod (i, "amt"), row.amount);
 
         row.amount.setTextBoxStyle (juce::Slider::TextBoxRight, false, 44, 18);
-        row.amount.setColour (juce::Slider::trackColourId, colours::accent2);
         row.amount.setDoubleClickReturnValue (true, 0.0);
 
         addAndMakeVisible (row.source);
@@ -126,20 +125,28 @@ void ModMatrixSection::resized()
 //==============================================================================
 LayerPanel::LayerPanel (RefractAudioProcessor& p, int layerIndex)
     : processor (p), layer (layerIndex), spectral (p, layerIndex),
-      on     (p.apvts, ids::layer (layerIndex, "on"), "On"),
-      level  (p.apvts, ids::layer (layerIndex, "level"), "Level"),
-      coarse (p.apvts, ids::layer (layerIndex, "coarse"), "Coarse", true),
-      fine   (p.apvts, ids::layer (layerIndex, "fine"), "Fine", true),
-      pan    (p.apvts, ids::layer (layerIndex, "pan"), "Pan", true),
-      start  (p.apvts, ids::layer (layerIndex, "start"), "Start"),
-      loop   (p.apvts, ids::layer (layerIndex, "loop"), "Loop")
+      on        (p.apvts, ids::layer (layerIndex, "on"),        "On"),
+      level     (p.apvts, ids::layer (layerIndex, "level"),     "Level"),
+      pan       (p.apvts, ids::layer (layerIndex, "pan"),       "Pan", true),
+      root      (p.apvts, ids::layer (layerIndex, "root"),      "Root"),
+      transpose (p.apvts, ids::layer (layerIndex, "coarse"),    "Transpose", true),
+      fine      (p.apvts, ids::layer (layerIndex, "fine"),      "Fine", true),
+      start     (p.apvts, ids::layer (layerIndex, "start"),     "Start"),
+      end       (p.apvts, ids::layer (layerIndex, "end"),       "End"),
+      loopMode  (p.apvts, ids::layer (layerIndex, "loopmode"),  "Loop"),
+      loopStart (p.apvts, ids::layer (layerIndex, "loopstart"), "Loop Start"),
+      loopEnd   (p.apvts, ids::layer (layerIndex, "loopend"),   "Loop End"),
+      crossfade (p.apvts, ids::layer (layerIndex, "xfade"),     "X-Fade"),
+      reverse   (p.apvts, ids::layer (layerIndex, "reverse"),   "Reverse")
 {
     addAndMakeVisible (spectral);
 
-    for (auto* c : std::initializer_list<juce::Component*> { &loadButton, &clearButton, &resetMaskButton, &invertMaskButton,
-                                                              &fileLabel, &toolBox, &modeBox, &sizeSlider, &strengthSlider,
-                                                              &sizeLabel, &strengthLabel, &hintLabel,
-                                                              &on, &level, &coarse, &fine, &pan, &start, &loop })
+    for (auto* c : std::initializer_list<juce::Component*> {
+             &loadButton, &clearButton, &waveButton, &spectralButton, &fitButton, &snapButton, &fileLabel,
+             &resetMaskButton, &invertMaskButton, &toolBox, &modeBox, &sizeSlider, &strengthSlider,
+             &sizeLabel, &strengthLabel,
+             &on, &level, &pan, &root, &transpose, &fine, &detectButton, &start, &end,
+             &loopMode, &loopStart, &loopEnd, &crossfade, &reverse })
         addAndMakeVisible (c);
 
     fileLabel.setColour (juce::Label::textColourId, colours::text);
@@ -160,6 +167,19 @@ LayerPanel::LayerPanel (RefractAudioProcessor& p, int layerIndex)
     };
     clearButton.onClick = [this] { processor.clearSample (layer); };
 
+    // --- View ----------------------------------------------------------------
+    for (auto* b : { &waveButton, &spectralButton })
+    {
+        b->setClickingTogglesState (true);
+        b->setRadioGroupId (2000 + layer);
+    }
+    waveButton.onClick     = [this] { setView (SpectralEditor::View::waveform); };
+    spectralButton.onClick = [this] { setView (SpectralEditor::View::spectral); };
+    fitButton.onClick      = [this] { spectral.zoomToFit(); };
+    fitButton.setTooltip ("Show the whole sample (or double-click the ruler). Scroll or pinch to zoom.");
+    snapButton.onClick     = [this] { spectral.setSnapToZero (snapButton.getToggleState()); };
+    snapButton.setTooltip ("Snap markers to zero crossings, so cuts and loops don't click");
+
     // --- Painting tools ----------------------------------------------------
     toolBox.addItemList ({ "Brush", "Rectangle" }, 1);
     toolBox.setSelectedId (1, juce::dontSendNotification);
@@ -170,6 +190,7 @@ LayerPanel::LayerPanel (RefractAudioProcessor& p, int layerIndex)
     modeBox.setSelectedId (1, juce::dontSendNotification);
     modeBox.onChange = [this] { spectral.setMode (modeBox.getSelectedId() == 1 ? SpectralEditor::Mode::remove
                                                                                : SpectralEditor::Mode::restore); };
+    modeBox.setTooltip ("Right-drag always does the opposite");
 
     sizeSlider.setRange (3.0, 60.0);
     sizeSlider.setValue (14.0, juce::dontSendNotification);
@@ -181,8 +202,6 @@ LayerPanel::LayerPanel (RefractAudioProcessor& p, int layerIndex)
 
     styleLabel (sizeLabel, "Size");
     styleLabel (strengthLabel, "Strength");
-    styleLabel (hintLabel, "Right-drag = opposite mode");
-    hintLabel.setFont (juce::Font (juce::FontOptions (11.0f)));
 
     resetMaskButton.onClick = [this]
     {
@@ -199,6 +218,54 @@ LayerPanel::LayerPanel (RefractAudioProcessor& p, int layerIndex)
         processor.maskEdited (layer);
     };
 
+    // --- Tuning ------------------------------------------------------------------
+    detectButton.setTooltip ("Find the sample's pitch and set Root + Fine so it plays in tune");
+    detectButton.onClick = [this] { detectPitch(); };
+
+    setView (SpectralEditor::View::waveform);
+    refresh();
+}
+
+void LayerPanel::setView (SpectralEditor::View v)
+{
+    spectral.setView (v);
+    waveButton.setToggleState (v == SpectralEditor::View::waveform, juce::dontSendNotification);
+    spectralButton.setToggleState (v == SpectralEditor::View::spectral, juce::dontSendNotification);
+
+    const bool paintTools = v == SpectralEditor::View::spectral;
+    for (auto* c : std::initializer_list<juce::Component*> { &resetMaskButton, &invertMaskButton, &toolBox, &modeBox,
+                                                              &sizeSlider, &strengthSlider, &sizeLabel, &strengthLabel })
+        c->setVisible (paintTools);
+}
+
+void LayerPanel::setParameter (const juce::String& id, float value)
+{
+    if (auto* p = processor.apvts.getParameter (id))
+    {
+        p->beginChangeGesture();
+        p->setValueNotifyingHost (p->convertTo0to1 (value));
+        p->endChangeGesture();
+    }
+}
+
+void LayerPanel::detectPitch()
+{
+    const float midi = processor.detectPitch (layer);
+    if (midi < 0.0f)
+    {
+        detectedText = "no clear pitch found";
+    }
+    else
+    {
+        // Root = nearest note; Fine cancels out the leftover so that pressing the
+        // root key plays exactly that note.
+        const int note = juce::jlimit (0, 127, juce::roundToInt (midi));
+        const float cents = ((float) note - midi) * 100.0f;
+        setParameter (ids::layer (layer, "root"), (float) note);
+        setParameter (ids::layer (layer, "fine"), cents);
+        detectedText = "detected " + juce::MidiMessage::getMidiNoteName (note, true, true, 3)
+                     + (std::abs (cents) >= 0.5f ? " (" + juce::String (-cents, 0) + " ct)" : juce::String());
+    }
     refresh();
 }
 
@@ -210,6 +277,8 @@ void LayerPanel::refresh()
         text << "  (" << juce::String (info.lengthSeconds, 2) << " s)";
     if (info.missing)
         text << "  - missing!";
+    if (detectedText.isNotEmpty())
+        text << "  - " << detectedText;
     fileLabel.setText (text, juce::dontSendNotification);
     spectral.refresh (info);
 }
@@ -227,37 +296,49 @@ void LayerPanel::resized()
 {
     auto area = getLocalBounds().reduced (10);
 
-    // Toolbar
+    // Toolbar: [Load][Clear] file name ... [Wave][Spectral][Fit][Snap] | paint tools
     auto bar = area.removeFromTop (26);
-    loadButton.setBounds (bar.removeFromLeft (60));
+    loadButton.setBounds (bar.removeFromLeft (56));
     bar.removeFromLeft (4);
-    clearButton.setBounds (bar.removeFromLeft (56));
+    clearButton.setBounds (bar.removeFromLeft (52));
+    bar.removeFromLeft (10);
+    waveButton.setBounds (bar.removeFromLeft (52));
+    spectralButton.setBounds (bar.removeFromLeft (70));
+    bar.removeFromLeft (4);
+    fitButton.setBounds (bar.removeFromLeft (40));
+    bar.removeFromLeft (6);
+    snapButton.setBounds (bar.removeFromLeft (62));
     bar.removeFromLeft (8);
 
-    invertMaskButton.setBounds (bar.removeFromRight (60));
+    invertMaskButton.setBounds (bar.removeFromRight (56));
     bar.removeFromRight (4);
-    resetMaskButton.setBounds (bar.removeFromRight (90));
-    bar.removeFromRight (10);
-    strengthSlider.setBounds (bar.removeFromRight (80));
-    strengthLabel.setBounds (bar.removeFromRight (56));
-    sizeSlider.setBounds (bar.removeFromRight (80));
-    sizeLabel.setBounds (bar.removeFromRight (34));
-    bar.removeFromRight (6);
-    modeBox.setBounds (bar.removeFromRight (90));
+    resetMaskButton.setBounds (bar.removeFromRight (84));
+    bar.removeFromRight (8);
+    strengthSlider.setBounds (bar.removeFromRight (70));
+    strengthLabel.setBounds (bar.removeFromRight (54));
+    sizeSlider.setBounds (bar.removeFromRight (70));
+    sizeLabel.setBounds (bar.removeFromRight (32));
     bar.removeFromRight (4);
-    toolBox.setBounds (bar.removeFromRight (100));
+    modeBox.setBounds (bar.removeFromRight (86));
+    bar.removeFromRight (4);
+    toolBox.setBounds (bar.removeFromRight (96));
     bar.removeFromRight (8);
     fileLabel.setBounds (bar);
 
     area.removeFromTop (6);
 
-    // Layer knobs along the bottom
+    // Layer controls along the bottom, in groups
     auto controls = area.removeFromBottom (74);
-    hintLabel.setBounds (controls.removeFromRight (170));
-    juce::Component* row[] = { &on, &level, &coarse, &fine, &pan, &start, &loop };
-    const int w = juce::jmin (90, controls.getWidth() / (int) std::size (row));
-    for (auto* c : row)
-        c->setBounds (controls.removeFromLeft (w).reduced (3, 0));
+    const int w = controls.getWidth() / 15;
+    auto place = [&] (juce::Component& c) { c.setBounds (controls.removeFromLeft (w).reduced (2, 0)); };
+    auto gap = [&] { controls.removeFromLeft (w / 4); };
+
+    place (on); place (level); place (pan); gap();
+    place (root); place (transpose); place (fine);
+    detectButton.setBounds (controls.removeFromLeft (w).withSizeKeepingCentre (w - 6, 24)); gap();
+    place (start); place (end); gap();
+    place (loopMode); place (loopStart); place (loopEnd); place (crossfade);
+    place (reverse);
 
     area.removeFromBottom (6);
     spectral.setBounds (area);
@@ -302,9 +383,9 @@ RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor&
     filter.add<Knob>   (s, "flt_cutoff", "Cutoff");
     filter.add<Knob>   (s, "flt_res", "Resonance");
 
-    lfo1.add<Knob>   (s, "lfo1_rate", "Rate").slider.setColour (juce::Slider::rotarySliderFillColourId, colours::accent2);
+    lfo1.add<Knob>   (s, "lfo1_rate", "Rate");
     lfo1.add<Choice> (s, "lfo1_shape", "Shape");
-    lfo2.add<Knob>   (s, "lfo2_rate", "Rate").slider.setColour (juce::Slider::rotarySliderFillColourId, colours::accent2);
+    lfo2.add<Knob>   (s, "lfo2_rate", "Rate");
     lfo2.add<Choice> (s, "lfo2_shape", "Shape");
 
     delay.add<Knob> (s, "dly_time", "Time");
@@ -323,7 +404,7 @@ RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor&
 
     processor.addChangeListener (this);
     showLayer (0);
-    setSize (1140, 790);
+    setSize (1140, 830);
 }
 
 RefractAudioProcessorEditor::~RefractAudioProcessorEditor()
@@ -371,7 +452,7 @@ void RefractAudioProcessorEditor::resized()
     for (auto& tab : tabs)
         tab.setBounds (tabArea.removeFromLeft (tabW).reduced (3, 0));
 
-    auto layerArea = area.removeFromTop (350);
+    auto layerArea = area.removeFromTop (390);
     for (auto& panel : panels)
         panel->setBounds (layerArea);
 

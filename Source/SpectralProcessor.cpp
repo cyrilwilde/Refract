@@ -42,12 +42,12 @@ namespace refract::spectral
             return std::abs (d[0]) > 1.0e-9f ? 1.0f / d[0] : 1.0f;
         }
 
-        // Dark blue -> violet -> orange -> pale yellow
+        // Black -> greys -> white (quiet frequencies dark, loud ones bright)
         juce::Colour heat (float v)
         {
-            static const juce::Colour stops[] = { juce::Colour (0xff05060d), juce::Colour (0xff1b1650),
-                                                  juce::Colour (0xff6a1b7a), juce::Colour (0xffd2453b),
-                                                  juce::Colour (0xfff5a442), juce::Colour (0xfffff3c4) };
+            static const juce::Colour stops[] = { juce::Colour (0xff000000), juce::Colour (0xff141414),
+                                                  juce::Colour (0xff3a3a3a), juce::Colour (0xff767676),
+                                                  juce::Colour (0xffbdbdbd), juce::Colour (0xffffffff) };
             constexpr int numStops = (int) (sizeof (stops) / sizeof (stops[0]));
             v = juce::jlimit (0.0f, 1.0f, v) * (float) (numStops - 1);
             const int i = juce::jmin ((int) v, numStops - 2);
