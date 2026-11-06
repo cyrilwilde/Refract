@@ -170,7 +170,10 @@ Note: in Freq mode the LFO is still updated 1,500 times a second (once every 32 
   - **Osc 2 only:**
     - **Sync** restarts Osc 2 every time Osc 1 starts a cycle. Sweep Osc 2's Semi or Octave (or modulate them) for classic sync leads.
     - **FM** lets Osc 1 bend Osc 2's phase, for bells, metallic tones and growls. This is real audio-rate FM, unlike the LFO Freq mode.
-- **Sub + Noise.** The sub oscillator follows the note an octave or two down. **Noise** adds noise, and **Colour** goes from dark (−) through white (0) to bright (+).
+- **Sub + Noise.** The sub oscillator follows the note an octave or two down. **Tune** offsets it in semitones.
+  - **Pitch Env / Decay / Curve** make the sub start higher and drop to the note. **Pitch Env** is how far above the note it starts, **Decay** is how long the drop takes, and **Curve** goes from a straight glide (0) to a snappy drop (1).
+  - **Making a kick:** Sub on (sine, 0 Oct), Pitch Env 36-48 st, Decay 40-80 ms, Curve 0.6-0.8, amp envelope with a fast attack and about 300 ms decay and 0 sustain. Play around C1-C2.
+  - The sub always starts at the same point of its wave, so every hit sounds the same. **Noise** adds noise, and **Colour** goes from dark (−) through white (0) to bright (+).
 - **Voice mode.**
   - **Poly** plays chords.
   - **Mono** plays one note at a time and restarts the envelopes and samples on each new key.

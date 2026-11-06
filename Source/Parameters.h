@@ -195,7 +195,7 @@ namespace refract
         struct Lfo { P shape, mode, sync, retrig; I rate, ratio, depth, phase, jitter, smooth; };
 
         std::array<Layer, numLayers> layers;
-        P subOctave, subWave;  I subLevel;
+        P subOctave, subWave;  I subLevel, subTune, subPitchEnv, subPitchDecay, subPitchCurve;
         std::array<Osc, numOscs> oscs;
         P osc2Sync;            I osc2Fm;
         I noiseLevel, noiseColour;

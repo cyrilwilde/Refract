@@ -239,7 +239,7 @@ namespace refract
         juce::uint32 noteId = 0;
 
         // Sub and noise
-        double subPhase = 0.0, subIncrement = 0.0;
+        double subPhase = 0.0, subIncrement = 0.0, subIncStep = 0.0, subEnvTime = 0.0;
         int    subWave = 0;
         float  subGain = 0.0f, subStep = 0.0f, subPanL = 1.0f, subPanR = 1.0f;
         float  noiseGain = 0.0f, noiseStep = 0.0f, noiseLp = 0.0f, noiseLpCoef = 1.0f, noiseHpMix = 0.0f;

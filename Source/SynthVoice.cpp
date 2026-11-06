@@ -189,6 +189,7 @@ namespace refract
 
         computeModulation (controlBlockSize);   // so the very first sample is already modulated
         restartLayers();
+        subEnvTime = -(double) controlBlockSize / sampleRate;   // the first block's update brings it to 0
 
         if (! legato)
         {
@@ -222,6 +223,7 @@ namespace refract
             for (auto& ls : layers) { ls.gain += ls.gainStep * controlBlockSize; ls.gainStep = 0.0f; }
             for (auto& s : oscs)    { s.gain  += s.gainStep  * controlBlockSize; s.gainStep  = 0.0f; }
             subGain   += subStep   * controlBlockSize; subStep   = 0.0f;
+            subIncrement += subIncStep * controlBlockSize; subIncStep = 0.0;
             noiseGain += noiseStep * controlBlockSize; noiseStep = 0.0f;
         }
 
@@ -456,8 +458,19 @@ namespace refract
 
         // --- Sub oscillator ---
         {
+            // Pitch envelope: Amount semitones above the note at the start, falling
+            // to 0 over Decay. Curve bends the fall from straight (0) to a fast
+            // "drop" (1) - that snap is what makes it sound like a kick drum.
+            // The value is worked out for the *end* of this block and the pitch
+            // glides there sample by sample, so even fast sweeps are smooth.
+            subEnvTime += (double) n / sampleRate;
+            const double x = subEnvTime / (double) juce::jmax (0.001f, v (P.subPitchDecay));
+            const double shape = x >= 1.0 ? 0.0 : std::pow (1.0 - x, 1.0 + (double) v (P.subPitchCurve) * 7.0);
+            const double semis = (double) v (P.subTune) + (double) v (P.subPitchEnv) * shape;
+
             const int octave = (int) P.subOctave->load() - 2;          // choices: -2, -1, 0
-            subIncrement = baseHz * std::pow (2.0, octave) / sampleRate;
+            const double target = baseHz * std::pow (2.0, octave) * std::pow (2.0, semis / 12.0) / sampleRate;
+            subIncStep = (target - subIncrement) / (double) n;
             subWave = (int) P.subWave->load();
             panGains (voicePan + v (P.subPan), subPanL, subPanR);
             subStep = (v (P.subLevel) - subGain) / (float) n;
@@ -689,6 +702,7 @@ namespace refract
                     srcR[5] = s * subGain * subPanR;
                 }
                 subPhase += subIncrement;
+                subIncrement += subIncStep;
                 if (subPhase >= 1.0) subPhase -= std::floor (subPhase);
 
                 // --- Noise ---

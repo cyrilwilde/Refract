@@ -1110,6 +1110,10 @@ RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor&
     subNoise.add<Knob>   (s, "sub_level", "Sub");
     subNoise.add<Choice> (s, "sub_octave", "Octave");
     subNoise.add<Choice> (s, "sub_wave", "Wave");
+    subNoise.add<Knob>   (s, "sub_tune", "Tune", true);
+    subNoise.add<Knob>   (s, "sub_penv", "Pitch Env").slider.setTooltip ("How far above the note the sub starts (semitones). Try 36-48 with a short Decay for a kick.");
+    subNoise.add<Knob>   (s, "sub_pdecay", "Decay");
+    subNoise.add<Knob>   (s, "sub_pcurve", "Curve").slider.setTooltip ("0 = straight glide down, 1 = fast snappy drop");
     subNoise.add<Knob>   (s, "noise_level", "Noise");
     subNoise.add<Knob>   (s, "noise_colour", "Colour", true);
     subNoise.add<juce::Component>();   // keeps the grid even
@@ -1335,11 +1339,12 @@ void RefractAudioProcessorEditor::resized()
     filterRouting.setBounds (fp.reduced (3).withSizeKeepingCentre (fp.getWidth() - 6, 120));
 
     // Oscillator page: the two oscillators side by side, sub/noise and glide on the right
+    // Oscillator page: the two oscillators stacked on the left, sub/noise and glide on the right
     auto oscArea = oscPage.getLocalBounds();
-    auto right = oscArea.removeFromRight (oscArea.getWidth() * 22 / 100);
-    subNoise.setBounds (right.removeFromTop (right.getHeight() * 55 / 100).reduced (3));
+    auto right = oscArea.removeFromRight (oscArea.getWidth() * 36 / 100);
+    subNoise.setBounds (right.removeFromTop (right.getHeight() * 62 / 100).reduced (3));
     glide.setBounds (right.reduced (3));
-    osc1.setBounds (oscArea.removeFromLeft (oscArea.getWidth() / 2).reduced (3));
+    osc1.setBounds (oscArea.removeFromTop (oscArea.getHeight() / 2).reduced (3));
     osc2.setBounds (oscArea.reduced (3));
 
 

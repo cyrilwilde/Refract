@@ -161,6 +161,11 @@ namespace refract
         addFloat  (l, "sub_level",  "Sub Level", { 0.0f, 1.0f }, 0.0f);
         addChoice (l, "sub_octave", "Sub Octave", juce::StringArray { "-2 Oct", "-1 Oct", "0 Oct" }, 1);
         addChoice (l, "sub_wave",   "Sub Wave",   juce::StringArray { "Sine", "Triangle", "Square" }, 0);
+        // Sub pitch envelope: starts high and drops to the note - the classic way to make a kick
+        addFloat  (l, "sub_tune",   "Sub Tune", { -24.0f, 24.0f, 0.01f }, 0.0f, "st");
+        addFloat  (l, "sub_penv",   "Sub Pitch Env", { 0.0f, 96.0f, 0.01f }, 0.0f, "st");
+        addFloat  (l, "sub_pdecay", "Sub Pitch Decay", skewed (0.001f, 2.0f, 0.1f), 0.06f, "s");
+        addFloat  (l, "sub_pcurve", "Sub Pitch Curve", { 0.0f, 1.0f }, 0.6f);
 
         // --- Voice (whole-note pitch, pan and level - handy mod targets) ---
         addFloat (l, "voice_pitch", "Pitch", { -24.0f, 24.0f, 0.01f }, 0.0f, "st");
@@ -390,6 +395,10 @@ namespace refract
         subLevel  = idx ("sub_level");
         subOctave = raw ("sub_octave");
         subWave   = raw ("sub_wave");
+        subTune   = idx ("sub_tune");
+        subPitchEnv   = idx ("sub_penv");
+        subPitchDecay = idx ("sub_pdecay");
+        subPitchCurve = idx ("sub_pcurve");
 
         for (int e = 0; e < numEnvs; ++e)
             envs[(size_t) e] = { idx (ids::env (e, "a")), idx (ids::env (e, "d")),
