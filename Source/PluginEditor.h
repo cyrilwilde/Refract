@@ -177,6 +177,25 @@ private:
 };
 
 //==============================================================================
+// Preset bar:  < [preset menu] >  Save  Save As  Init  Folder
+//==============================================================================
+class PresetBar : public juce::Component
+{
+public:
+    explicit PresetBar (RefractAudioProcessor& p);
+    void refresh();   // re-scan the preset folder and show the current name
+    void resized() override;
+private:
+    void step (int delta);
+    void saveAs();
+    RefractAudioProcessor& processor;
+    juce::TextButton prev { "<" }, next { ">" }, save { "Save" }, saveAsButton { "Save As" }, init { "Init" }, folder { "Folder" };
+    juce::ComboBox list;
+    juce::Array<juce::File> files;
+    std::unique_ptr<juce::FileChooser> chooser;
+};
+
+//==============================================================================
 // Oscillator page
 //==============================================================================
 
@@ -290,13 +309,17 @@ private:
     std::array<std::unique_ptr<LayerPanel>, refract::numLayers> panels;
 
     // Bottom pages
-    std::array<juce::TextButton, 4> pageTabs;
-    juce::Component mainPage, oscPage, modPage;
+    PresetBar presetBar;
+    std::array<juce::TextButton, 5> pageTabs;
+    juce::Component mainPage, oscPage, filterPage, modPage;
     ModMatrixPage matrixPage;
 
     // Main page
-    Section ampEnv { "AMP ENVELOPE" }, filter { "FILTER" }, voice { "VOICE" };
+    Section ampEnv { "AMP ENVELOPE" }, voice { "VOICE" };
     Section delay { "DELAY" }, reverb { "REVERB" }, macros { "MACROS" }, output { "OUTPUT" };
+
+    // Filter page
+    Section filter1 { "FILTER 1", 2 }, filter2 { "FILTER 2", 2 }, filterRouting { "ROUTING" };
 
     // Oscillator page
     OscPanel osc1, osc2;

@@ -392,6 +392,101 @@ void ModMatrixPage::resized()
 }
 
 //==============================================================================
+//  Preset bar
+//==============================================================================
+PresetBar::PresetBar (RefractAudioProcessor& p) : processor (p)
+{
+    for (auto* c : std::initializer_list<juce::Component*> { &prev, &list, &next, &save, &saveAsButton, &init, &folder })
+        addAndMakeVisible (c);
+
+    list.setTextWhenNothingSelected ("Init");
+    list.onChange = [this]
+    {
+        const int id = list.getSelectedId();
+        if (id > 0 && id <= files.size())
+            processor.loadPreset (files[id - 1]);
+    };
+    prev.onClick = [this] { step (-1); };
+    next.onClick = [this] { step (+1); };
+    save.onClick = [this]
+    {
+        const auto current = processor.getCurrentPresetFile();
+        if (current.existsAsFile()) processor.savePreset (current);
+        else                        saveAs();
+    };
+    saveAsButton.onClick = [this] { saveAs(); };
+    init.onClick = [this] { processor.initialiseState(); };
+    folder.onClick = [] { RefractAudioProcessor::getPresetFolder().startAsProcess(); };
+
+    save.setTooltip ("Save over the current preset (asks for a name if it's new)");
+    saveAsButton.setTooltip ("Save as a new preset. Samples are copied into Music/Refract/Samples so presets never lose them.");
+    init.setTooltip ("Start from scratch: every setting back to default, samples cleared");
+    folder.setTooltip ("Open the preset folder in Finder - make sub-folders to organise presets");
+    refresh();
+}
+
+void PresetBar::refresh()
+{
+    files = RefractAudioProcessor::getPresetList();
+    const auto base = RefractAudioProcessor::getPresetFolder();
+    const auto current = processor.getCurrentPresetFile();
+
+    list.clear (juce::dontSendNotification);
+    int selected = 0;
+    for (int i = 0; i < files.size(); ++i)
+    {
+        // Show sub-folders as "Folder/Name"
+        const auto rel = files[i].getRelativePathFrom (base).replaceCharacter ('\\', '/');
+        list.addItem (rel.upToLastOccurrenceOf (".", false, false), i + 1);
+        if (files[i] == current) selected = i + 1;
+    }
+    if (selected > 0) list.setSelectedId (selected, juce::dontSendNotification);
+    else              list.setText (processor.getPresetName(), juce::dontSendNotification);
+}
+
+void PresetBar::step (int delta)
+{
+    files = RefractAudioProcessor::getPresetList();
+    if (files.isEmpty()) return;
+    int index = files.indexOf (processor.getCurrentPresetFile());
+    index = index < 0 ? (delta > 0 ? 0 : files.size() - 1) : (index + delta + files.size()) % files.size();
+    processor.loadPreset (files[index]);
+}
+
+void PresetBar::saveAs()
+{
+    const auto start = RefractAudioProcessor::getPresetFolder()
+                           .getChildFile (processor.getPresetName() + RefractAudioProcessor::presetExtension);
+    chooser = std::make_unique<juce::FileChooser> ("Save preset", start, "*" + juce::String (RefractAudioProcessor::presetExtension));
+    chooser->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles
+                              | juce::FileBrowserComponent::warnAboutOverwriting,
+                          [this] (const juce::FileChooser& fc)
+                          {
+                              const auto file = fc.getResult();
+                              if (file != juce::File())
+                                  processor.savePreset (file);
+                          });
+}
+
+void PresetBar::resized()
+{
+    auto r = getLocalBounds();
+    prev.setBounds (r.removeFromLeft (26));
+    r.removeFromLeft (2);
+    folder.setBounds (r.removeFromRight (54));
+    r.removeFromRight (4);
+    init.setBounds (r.removeFromRight (40));
+    r.removeFromRight (4);
+    saveAsButton.setBounds (r.removeFromRight (62));
+    r.removeFromRight (4);
+    save.setBounds (r.removeFromRight (46));
+    r.removeFromRight (6);
+    next.setBounds (r.removeFromRight (26));
+    r.removeFromRight (2);
+    list.setBounds (r);
+}
+
+//==============================================================================
 //  Oscillator page
 //==============================================================================
 void OscScope::paint (juce::Graphics& g)
@@ -767,7 +862,7 @@ void LayerPanel::resized()
 //  The editor window
 //==============================================================================
 RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor& p)
-    : AudioProcessorEditor (&p), processor (p), matrixPage (p),
+    : AudioProcessorEditor (&p), processor (p), presetBar (p), matrixPage (p),
       osc1 (p, 0), osc2 (p, 1),
       lfoSection ("LFO", { "1", "2", "3", "4" }, 3001),
       envSection ("ENVELOPE", { "2", "3", "4" }, 3002)
@@ -790,8 +885,10 @@ RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor&
     }
 
     // Page tabs for the bottom half
-    const char* pageNames[] = { "MAIN", "OSC", "MODULATION", "MATRIX" };
-    for (int i = 0; i < 4; ++i)
+    addAndMakeVisible (presetBar);
+
+    const char* pageNames[] = { "MAIN", "OSC", "FILTER", "MODULATION", "MATRIX" };
+    for (int i = 0; i < 5; ++i)
     {
         auto& tab = pageTabs[(size_t) i];
         tab.setButtonText (pageNames[i]);
@@ -807,9 +904,23 @@ RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor&
     ampEnv.add<Knob> (s, ids::env (0, "s"), "Sustain");
     ampEnv.add<Knob> (s, ids::env (0, "r"), "Release");
 
-    filter.add<Choice> (s, "flt_type", "Type");
-    filter.add<Knob>   (s, "flt_cutoff", "Cutoff");
-    filter.add<Knob>   (s, "flt_res", "Resonance");
+    // --- Filter page ---
+    for (int f = 0; f < 2; ++f)
+    {
+        auto& sec = f == 0 ? filter1 : filter2;
+        sec.add<Choice> (s, ids::filter (f, "type"), "Type");
+        sec.add<Knob>   (s, ids::filter (f, "cutoff"), "Cutoff");
+        sec.add<Knob>   (s, ids::filter (f, "res"), "Resonance");
+        sec.add<Knob>   (s, ids::filter (f, "drive"), "Drive");
+        auto& shape = sec.add<Knob> (s, ids::filter (f, "shape"), "Shape");
+        shape.slider.setTooltip ("Formant: vowel A-E-I-O-U.  Comb: darkens the repeats.");
+        sec.add<Knob>   (s, ids::filter (f, "key"), "Key Track");
+        sec.add<Knob>   (s, ids::filter (f, "env"), "Env 2", true);
+        sec.add<Knob>   (s, ids::filter (f, "mix"), "Mix");
+    }
+    filterRouting.add<Choice> (s, "flt_routing", "Routing");
+    for (auto* c : std::initializer_list<juce::Component*> { &filter1, &filterRouting, &filter2 })
+        filterPage.addAndMakeVisible (c);
 
     voice.add<Knob> (s, "voice_pitch", "Pitch", true);
     voice.add<Knob> (s, "voice_pan", "Pan", true);
@@ -828,7 +939,7 @@ RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor&
 
     output.add<Knob> (s, "master", "Master");
 
-    for (auto* c : std::initializer_list<juce::Component*> { &ampEnv, &filter, &voice, &delay, &reverb, &macros, &output })
+    for (auto* c : std::initializer_list<juce::Component*> { &ampEnv, &voice, &delay, &reverb, &macros, &output })
         mainPage.addAndMakeVisible (c);
 
     // --- Oscillator page ---
@@ -864,6 +975,7 @@ RefractAudioProcessorEditor::RefractAudioProcessorEditor (RefractAudioProcessor&
 
     addChildComponent (mainPage);
     addChildComponent (oscPage);
+    addChildComponent (filterPage);
     addChildComponent (modPage);
     addChildComponent (matrixPage);
 
@@ -908,12 +1020,13 @@ void RefractAudioProcessorEditor::showLayer (int index)
 
 void RefractAudioProcessorEditor::showPage (int index)
 {
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 5; ++i)
         pageTabs[(size_t) i].setToggleState (i == index, juce::dontSendNotification);
     mainPage.setVisible (index == 0);
     oscPage.setVisible (index == 1);
-    modPage.setVisible (index == 2);
-    matrixPage.setVisible (index == 3);
+    filterPage.setVisible (index == 2);
+    modPage.setVisible (index == 3);
+    matrixPage.setVisible (index == 4);
 }
 
 void RefractAudioProcessorEditor::changeListenerCallback (juce::ChangeBroadcaster*)
@@ -922,6 +1035,7 @@ void RefractAudioProcessorEditor::changeListenerCallback (juce::ChangeBroadcaste
     for (auto& panel : panels)
         panel->refresh();
     matrixPage.refresh();
+    presetBar.refresh();
 }
 
 void RefractAudioProcessorEditor::timerCallback()
@@ -998,7 +1112,8 @@ void RefractAudioProcessorEditor::resized()
     auto area = getLocalBounds().reduced (10, 0);
 
     auto header = area.removeFromTop (48);
-    auto tabArea = header.removeFromRight (360).reduced (0, 10);
+    auto tabArea = header.removeFromRight (330).reduced (0, 10);
+    presetBar.setBounds (header.withTrimmedLeft (250).withTrimmedRight (16).reduced (0, 10));
     const int tabW = tabArea.getWidth() / numLayers;
     for (auto& tab : tabs)
         tab.setBounds (tabArea.removeFromLeft (tabW).reduced (3, 0));
@@ -1010,12 +1125,13 @@ void RefractAudioProcessorEditor::resized()
     area.removeFromTop (6);
     auto pageRow = area.removeFromTop (24);
     for (auto& tab : pageTabs)
-        tab.setBounds (pageRow.removeFromLeft (110).reduced (2, 0));
+        tab.setBounds (pageRow.removeFromLeft (104).reduced (2, 0));
     area.removeFromTop (4);
     area.removeFromBottom (10);
 
     mainPage.setBounds (area);
     oscPage.setBounds (area);
+    filterPage.setBounds (area);
     modPage.setBounds (area);
     matrixPage.setBounds (area);
 
@@ -1036,7 +1152,13 @@ void RefractAudioProcessorEditor::resized()
     // Main page: two rows
     auto page = mainPage.getLocalBounds();
     const int rowH = page.getHeight() / 2;
-    layoutRow (page.removeFromTop (rowH), { { &ampEnv, 4 }, { &filter, 3 }, { &voice, 3 } });
+    layoutRow (page.removeFromTop (rowH), { { &ampEnv, 4 }, { &voice, 3 }, { &macros, 4 } });
+
+    // Filter page: Filter 1 | routing | Filter 2
+    auto fp = filterPage.getLocalBounds();
+    filter1.setBounds (fp.removeFromLeft (fp.getWidth() * 44 / 100).reduced (3));
+    filter2.setBounds (fp.removeFromRight (fp.getWidth() * 79 / 100).reduced (3));
+    filterRouting.setBounds (fp.reduced (3).withSizeKeepingCentre (fp.getWidth() - 6, 120));
 
     // Oscillator page: the two oscillators side by side, sub/noise and glide on the right
     auto oscArea = oscPage.getLocalBounds();
@@ -1045,7 +1167,7 @@ void RefractAudioProcessorEditor::resized()
     glide.setBounds (right.reduced (3));
     osc1.setBounds (oscArea.removeFromLeft (oscArea.getWidth() / 2).reduced (3));
     osc2.setBounds (oscArea.reduced (3));
-    layoutRow (page, { { &delay, 3 }, { &reverb, 3 }, { &macros, 4 }, { &output, 1 } });
+    layoutRow (page, { { &delay, 3 }, { &reverb, 3 }, { &output, 1 } });
 
     // Modulation page: LFOs on the left, envelopes on the right
     auto mod = modPage.getLocalBounds();

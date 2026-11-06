@@ -116,6 +116,7 @@ namespace refract
         inline juce::String modAmount (int slot) { return "mod" + juce::String (slot + 1) + "_amt"; }
         inline juce::String macro (int index) { return "macro" + juce::String (index + 1); }
         inline juce::String osc   (int index, const char* name) { return "osc" + juce::String (index + 1) + "_" + name; }
+        inline juce::String filter (int index, const char* name) { return "flt" + juce::String (index + 1) + "_" + name; }
     }
 
     juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
@@ -189,7 +190,9 @@ namespace refract
         P voiceMode, glideMode; I glideTime;
         std::array<Env, numEnvs> envs;
         std::array<Lfo, numLfos> lfos;
-        P filterType;          I cutoff, resonance;
+        struct Filter { P type; I cutoff, resonance, drive, keyTrack, envAmount, shape, mix; };
+        std::array<Filter, 2> filters;
+        P filterRouting;
         I pitch, pan, voiceLevel;
         std::array<P, numModSlots> modAmounts;
         std::array<P, numMacros> macros;

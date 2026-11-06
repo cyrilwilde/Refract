@@ -78,6 +78,18 @@ public:
     // For the oscillator display
     refract::WavetablePtr getWavetable (int index) const { return wavetables.get (index); }
 
+    // --- Presets (message thread) ------------------------------------------------
+    // Presets are XML files in Music/Refract/Presets (sub-folders allowed).
+    static constexpr const char* presetExtension = ".refract";
+    static juce::File getPresetFolder();
+    static juce::File getSampleFolder();
+    static juce::Array<juce::File> getPresetList();
+    bool savePreset (const juce::File& file);
+    bool loadPreset (const juce::File& file);
+    void initialiseState();
+    juce::String getPresetName() const      { return presetName; }
+    juce::File   getCurrentPresetFile() const { return currentPresetFile; }
+
     // --- Modulation (message thread) ------------------------------------------
     const refract::ParamTable& getParamTable() const { return table; }
     int  getModSource (int slot) const { return routing.source[(size_t) slot].load(); }
@@ -122,6 +134,8 @@ private:
     void timerCallback() override;   // frees replaced samples, off the audio thread
     void processDelay (juce::AudioBuffer<float>& buffer);
     void updateHostInfo();
+    juce::ValueTree createStateTree();
+    void restoreStateTree (const juce::ValueTree& root);
     void computeGlobalModulation (int numSamples);
     float gv (int index) const { return table.value (index, globalOffsets[(size_t) index]); }   // global value incl. modulation
     static const refract::ParamTable& buildTable (refract::ParamTable&, juce::AudioProcessorValueTreeState&, juce::AudioProcessor&);
@@ -142,6 +156,8 @@ private:
     std::atomic<bool> noteActive { false };
     std::array<std::atomic<float>, refract::numModSources> liveSources;
     std::array<LayerSlot, refract::numLayers> layers;
+    juce::String presetName { "Init" };
+    juce::File currentPresetFile;
 
     juce::CriticalSection dataLock, publishLock;
     std::vector<refract::SampleDataPtr> graveyard;   // old samples waiting to be freed

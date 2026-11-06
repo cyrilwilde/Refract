@@ -1,5 +1,6 @@
 #include "Parameters.h"
 #include "Wavetable.h"
+#include "Filters.h"
 
 namespace refract
 {
@@ -192,10 +193,20 @@ namespace refract
             addBool   (l, ids::lfo (i, "retrig"), n + "Retrigger", true);
         }
 
-        // --- Filter --------------------------------------------------------
-        addChoice (l, "flt_type",   "Filter Type", juce::StringArray { "Low Pass", "Band Pass", "High Pass" }, 0);
-        addFloat  (l, "flt_cutoff", "Cutoff", skewed (20.0f, 20000.0f, 1000.0f), 20000.0f, "Hz");
-        addFloat  (l, "flt_res",    "Resonance", { 0.0f, 1.0f }, 0.1f);
+        // --- Filters (two per voice, serial or parallel) ------------------------
+        for (int f = 0; f < 2; ++f)
+        {
+            const auto n = "Filter " + juce::String (f + 1) + " ";
+            addChoice (l, ids::filter (f, "type"),   n + "Type", filterModelNames(), f == 0 ? fltSvfLow : fltOff);
+            addFloat  (l, ids::filter (f, "cutoff"), n + "Cutoff", skewed (20.0f, 20000.0f, 1000.0f), f == 0 ? 20000.0f : 1000.0f, "Hz");
+            addFloat  (l, ids::filter (f, "res"),    n + "Resonance", { 0.0f, 1.0f }, 0.1f);
+            addFloat  (l, ids::filter (f, "drive"),  n + "Drive", { 0.0f, 1.0f }, 0.0f);
+            addFloat  (l, ids::filter (f, "key"),    n + "Key Track", { 0.0f, 1.0f }, 0.0f, "%");
+            addFloat  (l, ids::filter (f, "env"),    n + "Env 2 Amount", { -1.0f, 1.0f }, 0.0f);
+            addFloat  (l, ids::filter (f, "shape"),  n + "Shape", { 0.0f, 1.0f }, 0.0f);
+            addFloat  (l, ids::filter (f, "mix"),    n + "Mix", { 0.0f, 1.0f }, 1.0f, "%");
+        }
+        addChoice (l, "flt_routing", "Filter Routing", filterRoutingNames(), routeSerial);
 
         // --- Effects -------------------------------------------------------
         addFloat (l, "dly_time", "Delay Time",     skewed (10.0f, 2000.0f, 350.0f), 375.0f, "ms");
@@ -236,7 +247,8 @@ namespace refract
                 if (id.startsWith ("env" + juce::String (e + 1) + "_")) return "Env " + juce::String (e + 1);
             for (int i = 0; i < numLfos; ++i)
                 if (id.startsWith ("lfo" + juce::String (i + 1) + "_")) return "LFO " + juce::String (i + 1);
-            if (id.startsWith ("flt_"))   return "Filter";
+            if (id.startsWith ("flt1_"))  return "Filter 1";
+            if (id.startsWith ("flt2_"))  return "Filter 2";
             if (id.startsWith ("dly_"))   return "Delay";
             if (id.startsWith ("rev_"))   return "Reverb";
             return "Output";
@@ -369,9 +381,19 @@ namespace refract
             L.smooth = idx (ids::lfo (i, "smooth"));
         }
 
-        filterType = raw ("flt_type");
-        cutoff     = idx ("flt_cutoff");
-        resonance  = idx ("flt_res");
+        for (int f = 0; f < 2; ++f)
+        {
+            auto& F = filters[(size_t) f];
+            F.type      = raw (ids::filter (f, "type"));
+            F.cutoff    = idx (ids::filter (f, "cutoff"));
+            F.resonance = idx (ids::filter (f, "res"));
+            F.drive     = idx (ids::filter (f, "drive"));
+            F.keyTrack  = idx (ids::filter (f, "key"));
+            F.envAmount = idx (ids::filter (f, "env"));
+            F.shape     = idx (ids::filter (f, "shape"));
+            F.mix       = idx (ids::filter (f, "mix"));
+        }
+        filterRouting = raw ("flt_routing");
 
         pitch      = idx ("voice_pitch");
         pan        = idx ("voice_pan");

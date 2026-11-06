@@ -181,6 +181,47 @@ Note: in Freq mode the LFO is still updated 1,500 times a second (once every 32 
   - **Time** is how long the slide takes, the same whatever the interval. Glide works in Poly too: each new note slides from the last one played.
 - **Sample layers have unison too**: **Unison** (up to 4 copies), **Detune** (up to ±50 cents) and **Spread**, on the right of the layer strip.
 
+### Presets
+
+The preset bar sits at the top of the window.
+
+- **< / >** step through your presets, and the menu lists them all.
+- **Save** overwrites the current preset. If the sound hasn't been saved yet, it asks for a name.
+- **Save As** saves a new preset. **Init** starts from scratch. **Folder** opens the preset folder in Finder.
+
+Presets live in **Music › Refract › Presets** as `.refract` files. Make sub-folders there (e.g. `Bass`, `Pads`) and they show up as `Bass/Name` in the menu.
+
+**Samples are kept safe.** When you save, any sample a layer uses is copied once into **Music › Refract › Samples**, and the preset points at that copy. A preset keeps working even if you move or delete the original file. To share presets with someone, send them both folders.
+
+Presets hold everything: every dial, the mod matrix routing, the samples and the spectral painting. Live's own "Save Preset" (in the device title bar) works too, and saves the same information inside Live's library.
+
+### Filters (Stage 4, **FILTER** page)
+
+There are two filters per voice. **Routing** sets how they connect:
+- **Serial:** Filter 1 feeds Filter 2.
+- **Parallel:** both filter the same sound and are blended together.
+
+Set a filter's Type to *Off* to bypass it.
+
+**Types**
+
+| Type | Character |
+|---|---|
+| **SVF** Low / Band / High / Notch | Clean and precise, the all-rounder. |
+| **Ladder** LP 24 / LP 12 / HP 24 | Moog-style. Thick and round; the bass thins a little as resonance rises, and it self-oscillates near the top. |
+| **MS-20** Low / High | Korg-style. Aggressive, gritty resonance that screams and self-oscillates. Pair with Drive. |
+| **Comb +** / **Comb −** | A tuned, very short echo with feedback. Metallic, plucked and flanger-like; Cutoff sets the pitch. **Shape** darkens the repeats. |
+| **Formant** | Vowel sounds. **Shape** sweeps A-E-I-O-U, **Cutoff** shifts the "voice" up or down (1 kHz = natural), and **Resonance** sharpens the vowel. |
+
+**Controls**
+
+- **Drive** pushes the signal into soft saturation before the filter.
+- **Key Track** makes the cutoff follow the keyboard. At 100 %, the cutoff moves an octave for every octave you play.
+- **Env 2** is a built-in Envelope 2 → cutoff amount (−/+). This is the classic filter sweep, without touching the matrix.
+- **Mix** blends between the dry signal and the filtered one.
+
+All of these dials can be modulated, like everything else.
+
 ---
 
 ## Part 3: How it works
@@ -220,6 +261,7 @@ A plugin has two halves that run at the same time on different threads:
 | `CMakeLists.txt` | Build recipe: which formats to build, plugin IDs, universal binary settings. |
 | `Source/Parameters.h/.cpp` | Every automatable knob: its ID, range, default and how it's displayed. |
 | `Source/SampleData.h` | The loaded-sample type, and the lock-free "bank" the audio thread reads from. |
+| `Source/Filters.h` | The filter models: SVF, Ladder, MS-20, Comb, Formant. |
 | `Source/Wavetable.h/.cpp` | Wavetables: built-in tables, tables made from samples, anti-aliased mip levels. |
 | `Source/SpectralProcessor.h/.cpp` | The FFT maths: spectrogram picture, and rebuilding audio through the painted mask. |
 | `Source/SynthVoice.h/.cpp` | One playing note: sample playback, sub osc, envelopes, LFOs, filter, mod matrix. |
@@ -373,6 +415,20 @@ JUCE's `Synthesiser` class handles MIDI: it finds a free voice for each note-on 
   - JUCE's `Synthesiser` normally starts a fresh voice for every note. In these modes we always reuse voice 0 and keep a list of held keys.
   - Before handing voice 0 its new note, we call `prepareLegato`. The voice then ignores the "stop immediately" that JUCE sends first, and only changes pitch (Legato) or restarts envelopes and samples smoothly (Mono).
   - Releasing the current key hands the voice the most recent key still held.
+
+### 3.13 Stage 4: how the filters and presets work
+
+- **Zero-delay feedback (ZDF).** A resonant filter feeds its output back into its input. The old digital way used last sample's output, which adds a one-sample delay to the loop. That throws the tuning off at high cutoffs and can blow up when modulated. The SVF, Ladder and MS-20 here solve the feedback loop *exactly* each sample (the "topology-preserving transform" method), so they track the cutoff accurately and stay stable however hard you modulate them.
+- **SVF** (`runSvf`): Andrew Simper's trapezoidal state-variable filter. One calculation gives low, band and high pass at once, and notch is low + high.
+- **Ladder:** four one-pole stages in a row, with the output fed back to the input.
+  - The code works out what the last stage's output must be (`y4 = (G⁴·in + S) / (1 + k·G⁴)`), feeds that back, then runs the four stages.
+  - `tanh` on the input imitates the saturation of the transistors in the original.
+  - LP 12 takes the output after two stages instead of four. HP 24 combines the stage outputs using the binomial pattern 1, −4, 6, −4, 1.
+- **MS-20** (Korg-35 design, after Will Pirkle's model): two low-pass stages with a *high-passed* feedback path. The saturator sits inside the loop, which is why the resonance distorts and screams instead of just ringing.
+- **Comb:** a delay line whose length is one cycle of the cutoff frequency (`sampleRate / cutoff`), read with linear interpolation so it tunes smoothly. A one-pole low-pass in the feedback (Shape) darkens each repeat.
+- **Formant:** three band-pass SVFs set to the first three formant frequencies of a sung vowel (e.g. "A" ≈ 730, 1090, 2440 Hz), crossfaded between neighbouring vowels by Shape.
+- **I checked the filter maths numerically** before building it in. The low-pass slopes are 12 / 24 dB per octave as expected, the resonance peaks sit at the cutoff, and nothing goes unstable.
+- **Presets** use the same code that saves your Live set (`createStateTree` / `restoreStateTree`), written to disk as readable XML. Loading a preset clears any layer the preset doesn't use, so you never get leftover samples from the previous sound.
 
 ---
 

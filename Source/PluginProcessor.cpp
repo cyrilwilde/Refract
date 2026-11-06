@@ -81,9 +81,9 @@ RefractAudioProcessor::RefractAudioProcessor()
         synth.addVoice (new RefractVoice (i, shared));
 
     // Starting routes, all at amount 0 - turn an amount up in the matrix to hear them
-    setModRouting (0, srcEnv2,     table.indexOf ("flt_cutoff"));
+    setModRouting (0, srcEnv2,     table.indexOf ("flt1_cutoff"));
     setModRouting (1, srcLfo1,     table.indexOf ("voice_pitch"));
-    setModRouting (2, srcModWheel, table.indexOf ("flt_cutoff"));
+    setModRouting (2, srcModWheel, table.indexOf ("flt1_cutoff"));
 
     // The built-in wavetables take a moment to calculate, so build them in the
     // background; oscillators in Wavetable mode stay silent until they're ready.
@@ -604,9 +604,10 @@ RefractAudioProcessor::LayerDisplayInfo RefractAudioProcessor::getDisplayInfo (i
 //==============================================================================
 //  State: parameters + which file each layer uses + its painted mask
 //==============================================================================
-void RefractAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
+juce::ValueTree RefractAudioProcessor::createStateTree()
 {
     juce::ValueTree root ("RefractState");
+    root.setProperty ("preset", presetName, nullptr);
     root.appendChild (apvts.copyState(), nullptr);
 
     juce::ValueTree layerTree ("Layers");
@@ -635,20 +636,15 @@ void RefractAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
         modTree.appendChild (slot, nullptr);
     }
     root.appendChild (modTree, nullptr);
-
-    if (auto xml = root.createXml())
-        copyXmlToBinary (*xml, destData);
+    return root;
 }
 
-void RefractAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
+void RefractAudioProcessor::restoreStateTree (const juce::ValueTree& root)
 {
-    auto xml = getXmlFromBinary (data, sizeInBytes);
-    if (xml == nullptr)
-        return;
-
-    const auto root = juce::ValueTree::fromXml (*xml);
     if (! root.hasType ("RefractState"))
         return;
+
+    presetName = root.getProperty ("preset", "Init").toString();
 
     const auto paramTree = root.getChildWithName (apvts.state.getType());
     if (paramTree.isValid())
@@ -669,11 +665,15 @@ void RefractAudioProcessor::setStateInformation (const void* data, int sizeInByt
         }
     }
 
+    // Layers not mentioned (or with no file) are cleared, so a preset never
+    // inherits samples from whatever was loaded before.
+    std::array<bool, numLayers> seen {};
     for (const auto l : root.getChildWithName ("Layers"))
     {
         const int i = l.getProperty ("index", -1);
         if (i < 0 || i >= numLayers)
             continue;
+        seen[(size_t) i] = true;
 
         const auto path = l.getProperty ("file").toString();
         if (path.isEmpty() || ! juce::File::isAbsolutePath (path))
@@ -687,6 +687,108 @@ void RefractAudioProcessor::setStateInformation (const void* data, int sizeInByt
         slot.mask = decodeMask (l.getProperty ("mask").toString());
         startJob (i, true);
     }
+    for (int i = 0; i < numLayers; ++i)
+        if (! seen[(size_t) i])
+            clearSample (i);
+
+    sendChangeMessage();
+}
+
+void RefractAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    if (auto xml = createStateTree().createXml())
+        copyXmlToBinary (*xml, destData);
+}
+
+void RefractAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
+{
+    if (auto xml = getXmlFromBinary (data, sizeInBytes))
+        restoreStateTree (juce::ValueTree::fromXml (*xml));
+}
+
+//==============================================================================
+//  Presets
+//==============================================================================
+juce::File RefractAudioProcessor::getPresetFolder()
+{
+    auto dir = juce::File::getSpecialLocation (juce::File::userMusicDirectory).getChildFile ("Refract").getChildFile ("Presets");
+    dir.createDirectory();
+    return dir;
+}
+
+juce::File RefractAudioProcessor::getSampleFolder()
+{
+    auto dir = juce::File::getSpecialLocation (juce::File::userMusicDirectory).getChildFile ("Refract").getChildFile ("Samples");
+    dir.createDirectory();
+    return dir;
+}
+
+juce::Array<juce::File> RefractAudioProcessor::getPresetList()
+{
+    auto files = getPresetFolder().findChildFiles (juce::File::findFiles, true, "*" + juce::String (presetExtension));
+    files.sort();   // juce::File sorts by full path, so sub-folders group together
+    return files;
+}
+
+bool RefractAudioProcessor::savePreset (const juce::File& chosen)
+{
+    const auto file = chosen.withFileExtension (presetExtension);
+
+    // Copy each layer's sample into Music/Refract/Samples (once), so presets
+    // keep working even if the original files are moved or deleted.
+    const auto sampleDir = getSampleFolder();
+    for (int i = 0; i < numLayers; ++i)
+    {
+        auto& slot = layers[(size_t) i];
+        if (! slot.file.existsAsFile() || slot.file.isAChildOf (sampleDir))
+            continue;
+        auto target = sampleDir.getChildFile (slot.file.getFileName());
+        if (target.existsAsFile() && target.getSize() != slot.file.getSize())
+            target = target.getNonexistentSibling();
+        if (target.existsAsFile() || slot.file.copyFileTo (target))
+            slot.file = target;
+    }
+
+    presetName = file.getFileNameWithoutExtension();
+    currentPresetFile = file;
+    const auto xml = createStateTree().createXml();
+    const bool ok = xml != nullptr && xml->writeTo (file);
+    sendChangeMessage();
+    return ok;
+}
+
+bool RefractAudioProcessor::loadPreset (const juce::File& file)
+{
+    auto xml = juce::parseXML (file);
+    if (xml == nullptr)
+        return false;
+    const auto tree = juce::ValueTree::fromXml (*xml);
+    if (! tree.hasType ("RefractState"))
+        return false;
+
+    restoreStateTree (tree);
+    presetName = file.getFileNameWithoutExtension();
+    currentPresetFile = file;
+    sendChangeMessage();
+    return true;
+}
+
+void RefractAudioProcessor::initialiseState()
+{
+    // Every dial back to its default, samples cleared, matrix back to its starting routes
+    for (auto* p : getParameters())
+        p->setValueNotifyingHost (p->getDefaultValue());
+    for (int i = 0; i < numLayers; ++i)
+        clearSample (i);
+    for (int s = 0; s < numModSlots; ++s)
+        setModRouting (s, srcNone, -1);
+    setModRouting (0, srcEnv2,     table.indexOf ("flt1_cutoff"));
+    setModRouting (1, srcLfo1,     table.indexOf ("voice_pitch"));
+    setModRouting (2, srcModWheel, table.indexOf ("flt1_cutoff"));
+
+    presetName = "Init";
+    currentPresetFile = juce::File();
+    sendChangeMessage();
 }
 
 //==============================================================================

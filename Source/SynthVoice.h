@@ -11,6 +11,7 @@
 #include "Parameters.h"
 #include "SampleData.h"
 #include "Wavetable.h"
+#include "Filters.h"
 
 namespace refract
 {
@@ -243,8 +244,9 @@ namespace refract
         float  subGain = 0.0f, subStep = 0.0f, subPanL = 1.0f, subPanR = 1.0f;
         float  noiseGain = 0.0f, noiseStep = 0.0f, noiseLp = 0.0f, noiseLpCoef = 1.0f, noiseHpMix = 0.0f;
 
-        juce::dsp::StateVariableTPTFilter<float> filter;
-        int filterType = -1;
+        std::array<VoiceFilter, 2> filters;
+        std::array<float, 2> filterMix { 1.0f, 1.0f };
+        int filterRouting = routeSerial;
 
         // Pitch and glide
         int   note = 60;                  // the key that was pressed

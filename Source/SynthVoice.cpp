@@ -71,8 +71,8 @@ namespace refract
         for (auto& e : envs) e.setSampleRate (sr);
         for (auto& l : lfos) l.setSampleRate (sr);
 
-        filter.prepare ({ sr, (juce::uint32) maxBlockSize, 2 });
-        filterType = -1;
+        juce::ignoreUnused (maxBlockSize);
+        for (auto& f : filters) f.prepare (sr);
     }
 
     // Converts the Start/End/Loop knobs (0..1 of the sample) into sample positions.
@@ -210,7 +210,7 @@ namespace refract
             subPhase = 0.0;
             subGain = subStep = 0.0f;
             noiseGain = noiseStep = noiseLp = 0.0f;
-            filter.reset();
+            for (auto& f : filters) f.reset();
             for (auto& e : envs) e.reset();
         }
 
@@ -471,17 +471,21 @@ namespace refract
             noiseStep = (v (P.noiseLevel) - noiseGain) / (float) n;
         }
 
-        // --- Filter ---
-        const int type = (int) P.filterType->load();
-        if (type != filterType)
+        // --- Filters ---
+        // Cutoff = the dial (with modulation) + its own Env 2 amount + key tracking.
+        // Env 2 moves the cutoff along the dial's travel, so sweeps sound even.
+        const auto& T = *shared.table;
+        filterRouting = (int) P.filterRouting->load();
+        for (int f = 0; f < 2; ++f)
         {
-            filterType = type;
-            filter.setType (type == 0 ? juce::dsp::StateVariableTPTFilterType::lowpass
-                          : type == 1 ? juce::dsp::StateVariableTPTFilterType::bandpass
-                                      : juce::dsp::StateVariableTPTFilterType::highpass);
+            const auto& F = P.filters[(size_t) f];
+            const auto& range = T[F.cutoff].range;
+            const float knob = range.convertTo0to1 (v (F.cutoff)) + v (F.envAmount) * envValues[1];
+            const float keyTrack = std::pow (2.0f, (pitch - 60.0f) / 12.0f * v (F.keyTrack));
+            const float hz = range.convertFrom0to1 (juce::jlimit (0.0f, 1.0f, knob)) * keyTrack;
+            filters[(size_t) f].setParameters ((int) F.type->load(), hz, v (F.resonance), v (F.drive), v (F.shape));
+            filterMix[(size_t) f] = v (F.mix);
         }
-        filter.setCutoffFrequency (juce::jlimit (20.0f, (float) sampleRate * 0.45f, v (P.cutoff)));
-        filter.setResonance (0.5f * std::pow (30.0f, v (P.resonance)));   // Q from 0.5 (soft) to 15 (screaming)
     }
 
     // One sample from an oscillator (all its unison voices), added into left/right.
@@ -682,9 +686,25 @@ namespace refract
                     right += s * noiseGain * 0.5f * subPanR;
                 }
 
-                // --- Filter, then the amp envelope ---
-                left  = filter.processSample (0, left);
-                right = filter.processSample (1, right);
+                // --- Filters (serial: 1 then 2; parallel: both, averaged), then the amp envelope ---
+                {
+                    auto run = [this] (int f, int ch, float x)
+                    {
+                        const float wet = filters[(size_t) f].process (ch, x);
+                        return x + filterMix[(size_t) f] * (wet - x);   // Mix: dry <-> filtered
+                    };
+                    const bool on1 = filters[0].isActive(), on2 = filters[1].isActive();
+                    if (filterRouting == routeSerial || ! (on1 && on2))
+                    {
+                        if (on1) { left = run (0, 0, left); right = run (0, 1, right); }
+                        if (on2) { left = run (1, 0, left); right = run (1, 1, right); }
+                    }
+                    else
+                    {
+                        left  = 0.5f * (run (0, 0, left)  + run (1, 0, left));
+                        right = 0.5f * (run (0, 1, right) + run (1, 1, right));
+                    }
+                }
 
                 for (int e = 0; e < numEnvs; ++e)
                     envValues[(size_t) e] = envs[(size_t) e].getNextSample();
